@@ -1,0 +1,8 @@
+numpy
+regex
+requests
+tqdm
+fire
+tensorflow-cpu
+jax[cuda11_pip]
+optax
