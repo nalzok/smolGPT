@@ -1,4 +1,7 @@
-import numpy as np
+from functools import partial
+
+import jax
+import jax.numpy as jnp
 from tqdm import tqdm
 import fire
 
@@ -6,18 +9,18 @@ from utils import load_encoder_hparams_and_params
 
 
 def gelu(x):
-    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))
+    return 0.5 * x * (1 + jnp.tanh(jnp.sqrt(2 / jnp.pi) * (x + 0.044715 * x**3)))
 
 
 def softmax(x):
-    exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
-    return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
+    exp_x = jnp.exp(x - jnp.max(x, axis=-1, keepdims=True))
+    return exp_x / jnp.sum(exp_x, axis=-1, keepdims=True)
 
 
 def layer_norm(x, g, b, eps: float = 1e-5):
-    mean = np.mean(x, axis=-1, keepdims=True)
-    variance = np.var(x, axis=-1, keepdims=True)
-    return g * (x - mean) / np.sqrt(variance + eps) + b
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    variance = jnp.var(x, axis=-1, keepdims=True)
+    return g * (x - mean) / jnp.sqrt(variance + eps) + b
 
 
 def linear(x, w, b):
@@ -29,17 +32,17 @@ def ffn(x, c_fc, c_proj):
 
 
 def attention(q, k, v, mask):
-    return softmax(q @ k.swapaxes(-2, -1) / np.sqrt(q.shape[-1]) + mask) @ v
+    return softmax(q @ k.swapaxes(-2, -1) / jnp.sqrt(q.shape[-1]) + mask) @ v
 
 
 def mha(x, c_attn, c_proj, n_head):
     T, C = x.shape
     x = linear(x, **c_attn)
-    q, k, v = np.split(x, 3, axis=-1)
+    q, k, v = jnp.split(x, 3, axis=-1)
     q = q.reshape(T, n_head, C // n_head).swapaxes(0, 1)
     k = k.reshape(T, n_head, C // n_head).swapaxes(0, 1)
     v = v.reshape(T, n_head, C // n_head).swapaxes(0, 1)
-    causal_mask = (1 - np.tri(x.shape[0], dtype=x.dtype)) * -1e10
+    causal_mask = (1 - jnp.tri(x.shape[0], dtype=x.dtype)) * -1e10
     out_heads = attention(q, k, v, causal_mask)
     x = out_heads.swapaxes(0, 1).reshape(T, C)
     x = linear(x, **c_proj)
@@ -52,8 +55,9 @@ def transformer_block(x, mlp, attn, ln_1, ln_2, n_head):
     return x
 
 
+@partial(jax.jit, static_argnums=(5,))
 def gpt2(inputs, wte, wpe, blocks, ln_f, n_head):
-    x = wte[inputs] + wpe[range(len(inputs))]
+    x = wte[inputs] + wpe[:len(inputs)]
     for block in blocks:
         x = transformer_block(x, **block, n_head=n_head)
     return layer_norm(x, **ln_f) @ wte.T
@@ -61,8 +65,8 @@ def gpt2(inputs, wte, wpe, blocks, ln_f, n_head):
 
 def generate(inputs, params, n_head, n_tokens_to_generate):
     for _ in tqdm(range(n_tokens_to_generate), "generating"):
-        logits = gpt2(inputs, **params, n_head=n_head)
-        next_id = np.argmax(logits[-1])
+        logits = gpt2(jnp.array(inputs), **params, n_head=n_head)
+        next_id = jnp.argmax(logits[-1])
         inputs.append(int(next_id))
     return inputs[len(inputs) - n_tokens_to_generate :]
 
