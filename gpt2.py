@@ -29,15 +29,20 @@ def ffn(x, c_fc, c_proj):
 
 
 def attention(q, k, v, mask):
-    return softmax(q @ k.T / np.sqrt(q.shape[-1]) + mask) @ v
+    return softmax(q @ k.swapaxes(-2, -1) / np.sqrt(q.shape[-1]) + mask) @ v
 
 
 def mha(x, c_attn, c_proj, n_head):
+    T, C = x.shape
     x = linear(x, **c_attn)
-    qkv_heads = list(map(lambda x: np.split(x, n_head, axis=-1), np.split(x, 3, axis=-1)))
+    q, k, v = np.split(x, 3, axis=-1)
+    q = q.reshape(T, n_head, C // n_head).swapaxes(0, 1)
+    k = k.reshape(T, n_head, C // n_head).swapaxes(0, 1)
+    v = v.reshape(T, n_head, C // n_head).swapaxes(0, 1)
     causal_mask = (1 - np.tri(x.shape[0], dtype=x.dtype)) * -1e10
-    out_heads = [attention(q, k, v, causal_mask) for q, k, v in zip(*qkv_heads)]
-    x = linear(np.hstack(out_heads), **c_proj)
+    out_heads = attention(q, k, v, causal_mask)
+    x = out_heads.swapaxes(0, 1).reshape(T, C)
+    x = linear(x, **c_proj)
     return x
 
 
