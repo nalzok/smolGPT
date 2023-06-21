@@ -89,3 +89,8 @@ def replicate(tree):
 
 def unreplicate(tree):
     return jax.tree_util.tree_map(lambda x: x[0], tree)
+
+
+# forward-over-reverse
+def hvp(f, primals, tangents):
+  return jax.jvp(jax.grad(f), primals, tangents)[1]

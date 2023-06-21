@@ -1,14 +1,16 @@
 from functools import partial
 from itertools import islice
+from operator import add
 
 import jax
+import jax.numpy as jnp
 import optax
 import numpy as np
 from tqdm import tqdm
 import fire
 
 from gpt2 import gpt2
-from utils import load_encoder_hparams_and_params, replicate, unreplicate
+from utils import load_encoder_hparams_and_params, replicate, unreplicate, hvp
 
 
 class DataLoader:
@@ -36,21 +38,28 @@ class DataLoader:
         return x, y
 
 
-
 @partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(4, 5), donate_argnums=(0, 1))
 def train_step(params, opt_state, inputs, targets, n_head, optimizer):
-    @partial(jax.value_and_grad)
     def loss_fn(p):
         logits = gpt2(inputs, **p, n_head=n_head)
         loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
-        # TODO: ignore label == -1
         return loss.mean()
 
-    loss, grads = loss_fn(params)
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    loss = jax.lax.pmean(loss, axis_name="batch")
     grads = jax.lax.pmean(grads, axis_name="batch")
     updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
-    return params, opt_state, loss
+
+    def agg(x, y):
+        return jnp.sum(x * y)
+
+    est_1st = jax.tree_util.tree_reduce(add, jax.tree_map(agg, updates, grads))
+    hv = hvp(loss_fn, (params,), (updates,))
+    hv = jax.lax.pmean(hv, axis_name="batch")
+    est_2nd = jax.tree_util.tree_reduce(add, jax.tree_map(agg, updates, hv))
+
+    return params, opt_state, loss, est_1st, est_2nd
 
 
 def train(tr, va, params, n_head, learning_rate, num_steps):
@@ -60,8 +69,11 @@ def train(tr, va, params, n_head, learning_rate, num_steps):
     params, opt_state = replicate((params, opt_state))
     dataloader = islice(zip(tr, va), num_steps)
     for (inputs, targets), _ in (pbar := tqdm(dataloader, "Training")):
-        params, opt_state, losses = train_step(params, opt_state, inputs, targets, n_head, optimizer)
-        pbar.set_description(f"{losses.mean() = }")
+        params, opt_state, loss, est_1st, est_2nd = train_step(params, opt_state, inputs, targets, n_head, optimizer)
+        loss = unreplicate(loss)
+        est_1st = unreplicate(est_1st)
+        est_2nd = unreplicate(est_2nd)
+        pbar.set_description(f"{loss = }, {est_1st = }, {est_2nd = }")
 
     return unreplicate(params)
 
