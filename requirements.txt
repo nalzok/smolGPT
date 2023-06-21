@@ -12,6 +12,8 @@ absl-py==1.4.0
     #   optax
     #   tensorboard
     #   tensorflow-cpu
+appdirs==1.4.4
+    # via wandb
 astunparse==1.6.3
     # via tensorflow-cpu
 cachetools==5.3.1
@@ -19,19 +21,29 @@ cachetools==5.3.1
     #   google-auth
     #   nvitop
 certifi==2023.5.7
-    # via requests
+    # via
+    #   requests
+    #   sentry-sdk
 charset-normalizer==3.1.0
     # via requests
 chex==0.1.7
     # via optax
+click==8.1.3
+    # via wandb
 dm-tree==0.1.8
     # via chex
+docker-pycreds==0.4.0
+    # via wandb
 fire==0.5.0
     # via -r requirements.in
 flatbuffers==23.5.26
     # via tensorflow-cpu
 gast==0.4.0
     # via tensorflow-cpu
+gitdb==4.0.10
+    # via gitpython
+gitpython==3.1.31
+    # via wandb
 google-auth==2.20.0
     # via
     #   google-auth-oauthlib
@@ -117,18 +129,25 @@ optax==0.1.5
     # via -r requirements.in
 packaging==23.1
     # via tensorflow-cpu
+pathtools==0.1.2
+    # via wandb
 protobuf==4.23.3
     # via
     #   tensorboard
     #   tensorflow-cpu
+    #   wandb
 psutil==5.9.5
-    # via nvitop
+    # via
+    #   nvitop
+    #   wandb
 pyasn1==0.5.0
     # via
     #   pyasn1-modules
     #   rsa
 pyasn1-modules==0.3.0
     # via google-auth
+pyyaml==6.0
+    # via wandb
 regex==2023.6.3
     # via -r requirements.in
 requests==2.31.0
@@ -136,6 +155,7 @@ requests==2.31.0
     #   -r requirements.in
     #   requests-oauthlib
     #   tensorboard
+    #   wandb
 requests-oauthlib==1.3.1
     # via google-auth-oauthlib
 rsa==4.9
@@ -144,13 +164,20 @@ scipy==1.10.1
     # via
     #   jax
     #   jaxlib
+sentry-sdk==1.25.1
+    # via wandb
+setproctitle==1.3.2
+    # via wandb
 six==1.16.0
     # via
     #   astunparse
+    #   docker-pycreds
     #   fire
     #   google-auth
     #   google-pasta
     #   tensorflow-cpu
+smmap==5.0.0
+    # via gitdb
 tensorboard==2.12.3
     # via tensorflow-cpu
 tensorboard-data-server==0.7.1
@@ -178,6 +205,9 @@ urllib3==1.26.16
     # via
     #   google-auth
     #   requests
+    #   sentry-sdk
+wandb==0.15.4
+    # via -r requirements.in
 werkzeug==2.3.6
     # via tensorboard
 wheel==0.40.0

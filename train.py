@@ -10,6 +10,7 @@ import optax
 import numpy as np
 from tqdm import tqdm
 import fire
+import wandb
 
 from gpt2 import gpt2
 from utils import load_encoder_hparams_and_params, replicate, unreplicate, hvp
@@ -40,46 +41,6 @@ class DataLoader:
         return x, y
 
 
-@partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(4, 5), donate_argnums=(0, 1))
-def train_step(params, opt_state, inputs, targets, n_head, optimizer):
-    def loss_fn(p):
-        logits = gpt2(inputs, **p, n_head=n_head)
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
-        return loss.mean()
-
-    loss, grads = jax.value_and_grad(loss_fn)(params)
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    grads = jax.lax.pmean(grads, axis_name="batch")
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    params = optax.apply_updates(params, updates)
-
-    def agg(x, y):
-        return jnp.sum(x * y)
-
-    est_1st = jax.tree_util.tree_reduce(add, jax.tree_map(agg, updates, grads))
-    hv = hvp(loss_fn, (params,), (updates,))
-    hv = jax.lax.pmean(hv, axis_name="batch")
-    est_2nd = est_1st + 0.5 * jax.tree_util.tree_reduce(add, jax.tree_map(agg, updates, hv))
-
-    return params, opt_state, loss, est_1st, est_2nd
-
-
-def train(tr, va, params, n_head, learning_rate, num_steps):
-    optimizer = optax.adamw(learning_rate)
-    opt_state = optimizer.init(params)
-
-    params, opt_state = replicate((params, opt_state))
-    dataloader = islice(zip(tr, va), num_steps)
-    for (inputs, targets), _ in (pbar := tqdm(dataloader, "Training")):
-        params, opt_state, loss, est_1st, est_2nd = train_step(params, opt_state, inputs, targets, n_head, optimizer)
-        loss = float(unreplicate(loss))
-        est_1st = float(unreplicate(est_1st))
-        est_2nd = float(unreplicate(est_2nd))
-        pbar.set_description(f"{loss = }, {est_1st = }, {est_2nd = }")
-
-    return unreplicate(params)
-
-
 def randomize(params, n_layer):
     # See https://github.com/karpathy/nanoGPT/blob/4eb7a96b077998f28b57938c2f1e511b0d8cab7c/model.py#L140-L145
     def init_param(path, leaf):
@@ -104,6 +65,61 @@ def randomize(params, n_layer):
     return params
 
 
+@partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(4, 5), donate_argnums=(0, 1))
+def train_step(params, opt_state, inputs, targets, n_head, optimizer):
+    def loss_fn(p):
+        logits = gpt2(inputs, **p, n_head=n_head)
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+        return loss.mean()
+
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    loss = jax.lax.pmean(loss, axis_name="batch")
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    params = optax.apply_updates(params, updates)
+
+    def agg(x, y):
+        return jnp.sum(x * y)
+
+    pred1 = jax.tree_util.tree_reduce(add, jax.tree_map(agg, updates, grads))
+    hv = hvp(loss_fn, (params,), (updates,))
+    hv = jax.lax.pmean(hv, axis_name="batch")
+    pred2 = pred1 + 0.5 * jax.tree_util.tree_reduce(add, jax.tree_map(agg, updates, hv))
+
+    return params, opt_state, loss, pred1, pred2
+
+
+def train(tr, va, params, n_head, learning_rate, num_steps):
+    optimizer = optax.adamw(learning_rate)
+    opt_state = optimizer.init(params)
+
+    params, opt_state = replicate((params, opt_state))
+    dataloader = islice(zip(tr, va), num_steps)
+    last_loss = float('inf')
+    last_pred1 = 0
+    last_pred2 = 0
+    for step, ((inputs, targets), _) in enumerate(pbar := tqdm(dataloader, "Training")):
+        params, opt_state, loss, pred1, pred2 = train_step(params, opt_state, inputs, targets, n_head, optimizer)
+        loss = float(unreplicate(loss))
+        pred1 = float(unreplicate(pred1))
+        pred2 = float(unreplicate(pred2))
+        pbar.set_description(f"{loss = }")
+
+        delta = last_loss - loss
+        wandb.log({
+            "step": step,
+            "loss": loss,
+            "delta": delta,
+            "pred1": last_pred1,
+            "pred2": last_pred2,
+            "err1": delta - last_pred1,
+            "err2": delta - last_pred2,
+        })
+        last_loss, last_pred1, last_pred2 = loss, pred1, pred2
+
+    return unreplicate(params)
+
+
 def main(learning_rate: float = 1e-4,
          num_steps: int = 2**20,
          batch_size: int = 72,
@@ -117,8 +133,10 @@ def main(learning_rate: float = 1e-4,
     tr = DataLoader("data/openwebtext/train.bin", context_length, batch_size)
     va = DataLoader("data/openwebtext/val.bin", context_length, batch_size)
 
+    wandb.init(project="smolGPT")
     params = randomize(params, n_layer)
     params = train(tr, va, params, n_head, learning_rate, num_steps)
+    wandb.finish()
 
 
 if __name__ == "__main__":

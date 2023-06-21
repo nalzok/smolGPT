@@ -7,3 +7,4 @@ tensorflow-cpu
 jax[cuda11_pip]
 optax
 nvitop
+wandb
