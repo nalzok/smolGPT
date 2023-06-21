@@ -6,3 +6,6 @@
 
 generate: .venv
 	.venv/bin/python3.10 -m gpt2 "Alan Turing theorized that computers would one day become"
+
+train: .venv
+	.venv/bin/python3.10 -m train

@@ -3,6 +3,7 @@ import os
 import re
 
 import numpy as np
+import jax
 import requests
 import tensorflow as tf
 from tqdm import tqdm
@@ -80,3 +81,11 @@ def load_encoder_hparams_and_params(model_size, models_dir):
     params = load_gpt2_params_from_tf_ckpt(tf_ckpt_path, hparams)
 
     return encoder, hparams, params
+
+
+def replicate(tree):
+    return jax.device_put_replicated(tree, jax.local_devices())
+
+
+def unreplicate(tree):
+    return jax.tree_util.tree_map(lambda x: x[0], tree)
