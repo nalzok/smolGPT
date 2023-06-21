@@ -93,4 +93,5 @@ def unreplicate(tree):
 
 # forward-over-reverse
 def hvp(f, primals, tangents):
-  return jax.jvp(jax.grad(f), primals, tangents)[1]
+  primals_out, tangents_out = jax.jvp(jax.grad(f), primals, tangents)
+  return tangents_out

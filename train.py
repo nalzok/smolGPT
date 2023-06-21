@@ -1,6 +1,8 @@
 from functools import partial
 from itertools import islice
 from operator import add
+from hashlib import sha1
+from sys import maxsize
 
 import jax
 import jax.numpy as jnp
@@ -57,7 +59,7 @@ def train_step(params, opt_state, inputs, targets, n_head, optimizer):
     est_1st = jax.tree_util.tree_reduce(add, jax.tree_map(agg, updates, grads))
     hv = hvp(loss_fn, (params,), (updates,))
     hv = jax.lax.pmean(hv, axis_name="batch")
-    est_2nd = jax.tree_util.tree_reduce(add, jax.tree_map(agg, updates, hv))
+    est_2nd = est_1st + 0.5 * jax.tree_util.tree_reduce(add, jax.tree_map(agg, updates, hv))
 
     return params, opt_state, loss, est_1st, est_2nd
 
@@ -70,26 +72,52 @@ def train(tr, va, params, n_head, learning_rate, num_steps):
     dataloader = islice(zip(tr, va), num_steps)
     for (inputs, targets), _ in (pbar := tqdm(dataloader, "Training")):
         params, opt_state, loss, est_1st, est_2nd = train_step(params, opt_state, inputs, targets, n_head, optimizer)
-        loss = unreplicate(loss)
-        est_1st = unreplicate(est_1st)
-        est_2nd = unreplicate(est_2nd)
+        loss = float(unreplicate(loss))
+        est_1st = float(unreplicate(est_1st))
+        est_2nd = float(unreplicate(est_2nd))
         pbar.set_description(f"{loss = }, {est_1st = }, {est_2nd = }")
 
     return unreplicate(params)
 
 
+def randomize(params, n_layer):
+    # See https://github.com/karpathy/nanoGPT/blob/4eb7a96b077998f28b57938c2f1e511b0d8cab7c/model.py#L140-L145
+    def init_param(path, leaf):
+        path_bytes = ".".join(str(p) for p in path).encode("utf-8")
+        path_hash = int(sha1(path_bytes).hexdigest(), 16) % maxsize
+        leaf_key = jax.random.PRNGKey(path_hash)
+
+        noise = jax.random.normal(leaf_key, leaf.shape, leaf.dtype)
+        if path[-1].key in {"wpe", "wte"}:
+            return noise * 0.02
+        elif path[-1].key == "b":
+            return jnp.zeros_like(noise)
+        elif path[-1].key in {"w", "g"}:
+            if path[-2].key == "c_proj":
+                return noise * 0.02/jnp.sqrt(2*n_layer)
+            else:
+                return noise * 0.02
+        else:
+            raise ValueError(f"Unknown path {path}")
+
+    params = jax.tree_util.tree_map_with_path(init_param, params)
+    return params
+
+
 def main(learning_rate: float = 1e-4,
-         num_steps: int = 1024,
-         batch_size: int = 64,
+         num_steps: int = 2**20,
+         batch_size: int = 72,
          model_size: str = "124M",
          models_dir: str = "models"):
     encoder, hparams, params = load_encoder_hparams_and_params(model_size, models_dir)
     context_length = hparams["n_ctx"]
     n_head = hparams["n_head"]
+    n_layer = hparams["n_layer"]
 
     tr = DataLoader("data/openwebtext/train.bin", context_length, batch_size)
     va = DataLoader("data/openwebtext/val.bin", context_length, batch_size)
 
+    params = randomize(params, n_layer)
     params = train(tr, va, params, n_head, learning_rate, num_steps)
 
 
