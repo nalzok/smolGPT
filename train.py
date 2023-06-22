@@ -70,7 +70,7 @@ def randomize(params, n_layer, policy):
 def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform, policy):
 
     def loss_fn(p, input_, target):
-        p, input_, target = policy.cast_to_compute((p, input_, target))
+        p = policy.cast_to_compute(p)
         logits = gpt2(input_, **p, n_head=n_head)
         losses = optax.softmax_cross_entropy_with_integer_labels(logits, target)
         losses = policy.cast_to_output(losses)
