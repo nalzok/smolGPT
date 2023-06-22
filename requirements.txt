@@ -71,6 +71,8 @@ jaxlib==0.4.12+cuda11.cudnn86
     #   chex
     #   jax
     #   optax
+jmp==0.0.4
+    # via -r requirements.in
 keras==2.12.0
     # via tensorflow-cpu
 libclang==16.0.0
@@ -90,6 +92,7 @@ numpy==1.23.5
     #   h5py
     #   jax
     #   jaxlib
+    #   jmp
     #   ml-dtypes
     #   opt-einsum
     #   optax

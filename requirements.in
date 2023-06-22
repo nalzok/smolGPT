@@ -5,6 +5,7 @@ tqdm
 fire
 tensorflow-cpu
 jax[cuda11_pip]
+jmp
 optax
-nvitop
 wandb
+nvitop
