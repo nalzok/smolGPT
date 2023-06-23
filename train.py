@@ -105,29 +105,7 @@ def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_
         (new_params, new_opt_state),
         (params, opt_state))
 
-    def agg(x, y):
-        return jnp.sum(x * y)
-
-    params, updates, grads = policy.cast_to_compute((params, updates, grads))
-    pred1 = jax.tree_util.tree_reduce(add, jax.tree_map(agg, updates, grads))
-
-    def sum_hvp(hvp, x):
-        input_, target = x
-        def grad_fn(p):
-            grads, loss = jax.grad(loss_fn, has_aux=True)(p, input_, target)
-            return loss_scale.unscale(grads), loss
-        curr_grad, curr_hvp, loss = jax.jvp(grad_fn, (params,), (updates,), has_aux=True)
-        new_hvp = jax.tree_map(add, hvp, curr_hvp)
-        return new_hvp, loss
-
-    hvp, _ = jax.lax.scan(sum_hvp, init, xs)
-    hvp = jax.tree_map(lambda x: x/inputs.shape[0], hvp)
-    hvp = loss_scale.unscale(hvp)
-    hvp = policy.cast_to_compute(hvp)
-    hvp = jax.lax.pmean(hvp, axis_name="batch")
-    pred2 = pred1 + 0.5 * jax.tree_util.tree_reduce(add, jax.tree_map(agg, updates, hvp))
-
-    return new_params, new_opt_state, new_loss_scale, loss, grads_finite, pred1, pred2
+    return new_params, new_opt_state, new_loss_scale, loss, grads_finite
 
 
 def train(params,
@@ -162,33 +140,25 @@ def train(params,
 
     params, opt_state, loss_scale = replicate((params, opt_state, loss_scale))
     dataloader = islice(zip(tr, va), max_iter)
-    last_loss = float("inf")
-    last_pred1 = 0
-    last_pred2 = 0
 
-    for step, ((inputs, targets), _) in enumerate(pbar := tqdm(dataloader, "Training")):
-        params, opt_state, loss_scale, loss, grads_finite, pred1, pred2 \
+    for (inputs, targets), _ in (pbar := tqdm(dataloader, "Training")):
+        params, opt_state, loss_scale, loss, grads_finite \
                 = train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform, policy)
+        _, _, _, schedule_state, _ = opt_state
+        step = int(unreplicate(schedule_state.count))
+        lr = float(scheduler(step))
         scale = float(unreplicate(loss_scale).loss_scale)
         loss = float(jnp.mean(loss))
         grads_finite = float(unreplicate(grads_finite))
-        pred1 = float(unreplicate(pred1))
-        pred2 = float(unreplicate(pred2))
-        pbar.set_description(f"{scale = }, {loss = }, {grads_finite = }")
 
-        delta = last_loss - loss
+        pbar.set_description(f"{scale = }, {lr = }, {loss = }, {grads_finite = }")
         wandb.log({
             "step": step,
+            "lr": lr,
             "scale": scale,
             "loss": loss,
             "grads_finite": grads_finite,
-            "delta": delta,
-            "pred1": last_pred1,
-            "pred2": last_pred2,
-            "err1": delta - last_pred1,
-            "err2": delta - last_pred2,
         })
-        last_loss, last_pred1, last_pred2 = loss, pred1, pred2
 
     return unreplicate(params)
 
