@@ -63,6 +63,7 @@ def randomize(params, n_layer, policy):
             raise ValueError(f"Unknown path {path}")
 
     params = jax.tree_util.tree_map_with_path(init_param, params)
+    # TODO: gradient tying
     return params
 
 
@@ -70,10 +71,8 @@ def randomize(params, n_layer, policy):
 def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform, policy):
 
     def loss_fn(p, input_, target):
-        p = policy.cast_to_compute(p)
         logits = gpt2(input_, **p, n_head=n_head)
         losses = optax.softmax_cross_entropy_with_integer_labels(logits, target)
-        losses = policy.cast_to_output(losses)
         loss = jnp.mean(losses)
         return loss_scale.scale(loss), loss
 
@@ -105,7 +104,7 @@ def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_
         (new_params, new_opt_state),
         (params, opt_state))
 
-    return new_params, new_opt_state, new_loss_scale, loss, grads_finite
+    return new_params, new_opt_state, new_loss_scale, loss, grads_finite, grads
 
 
 def train(params,
@@ -128,21 +127,22 @@ def train(params,
             warmup_steps=warmup_iters,
             decay_steps=lr_decay_iters,
             end_value=min_lr)
+    mask = jax.tree_map(lambda x: x.ndim >= 2, params)
     gradient_transform = optax.chain(
             optax.clip_by_global_norm(grad_clip),
             optax.scale_by_adam(beta1, beta2),
-            optax.add_decayed_weights(weight_decay),
+            optax.add_decayed_weights(weight_decay, mask),
             optax.scale_by_schedule(scheduler),
             optax.scale(-1.0),
     )
     opt_state = gradient_transform.init(params)
-    loss_scale = jmp.DynamicLossScale(jnp.array(2. ** 15, dtype=policy.param_dtype))
+    loss_scale = jmp.DynamicLossScale(jnp.array(2. ** 16, dtype=policy.param_dtype))
 
     params, opt_state, loss_scale = replicate((params, opt_state, loss_scale))
     dataloader = islice(zip(tr, va), max_iter)
 
     for (inputs, targets), _ in (pbar := tqdm(dataloader, "Training")):
-        params, opt_state, loss_scale, loss, grads_finite \
+        params, opt_state, loss_scale, loss, grads_finite, grads \
                 = train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform, policy)
         _, _, _, schedule_state, _ = opt_state
         step = int(unreplicate(schedule_state.count))
@@ -157,6 +157,7 @@ def train(params,
             "lr": lr,
             "scale": scale,
             "loss": loss,
+            "norm": float(optax.global_norm(unreplicate(grads))),
             "grads_finite": grads_finite,
         })
 
