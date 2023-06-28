@@ -1,7 +1,6 @@
 from pathlib import Path
 from functools import partial
 from itertools import islice
-from operator import add
 from hashlib import sha1
 from sys import maxsize
 
@@ -77,22 +76,23 @@ def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_
     def loss_fn(p, input_, target):
         logits = gpt2(input_, **p, n_head=n_head)
         losses = optax.softmax_cross_entropy_with_integer_labels(logits, target)
-        loss = jnp.mean(losses) / inputs.shape[0]
+        loss = jnp.mean(losses)
         return loss_scale.scale(loss), loss
 
     def sum_grads(grads, x):
-        input_, target = x
+        input_, target, i = x
         curr_grads, loss = jax.grad(loss_fn, has_aux=True)(params_compute, input_, target)
-        new_grads = jax.tree_map(add, grads, curr_grads)
+        welford_update = lambda acc, new: acc + (new - acc) / (i + 1)
+        new_grads = jax.tree_map(welford_update, grads, curr_grads)
         return new_grads, loss
 
     # use map/scan-over-grad instead of grad-over-map/scan to reduce memory consumption
     params_compute = policy.cast_to_compute(params)
     init = jax.tree_map(jnp.zeros_like, params_compute)
-    xs = (inputs, targets)
+    xs = (inputs, targets, jnp.arange(inputs.shape[0]))
     grads, losses = jax.lax.scan(sum_grads, init, xs)
     losses = policy.cast_to_output(losses)
-    loss = jnp.sum(losses)
+    loss = jnp.mean(losses)
 
     grads = policy.cast_to_param(grads)
     grads = jax.lax.pmean(grads, axis_name="batch")
