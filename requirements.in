@@ -7,5 +7,6 @@ tensorflow-cpu
 jax[cuda11_pip]
 jmp
 optax
+chex
 wandb
 nvitop

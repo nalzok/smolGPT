@@ -1,9 +1,11 @@
+from typing import Optional
 import json
 import os
 import re
 
 import numpy as np
 import jax
+import chex
 import requests
 import tensorflow as tf
 from tqdm import tqdm
@@ -89,3 +91,9 @@ def replicate(tree):
 
 def unreplicate(tree):
     return jax.tree_util.tree_map(lambda x: x[0], tree)
+
+
+def canonicalize_dtype(dtype: Optional[chex.ArrayDType]) -> Optional[chex.ArrayDType]:
+    if dtype is not None:
+        return jax.dtypes.canonicalize_dtype(dtype)
+    return dtype

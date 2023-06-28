@@ -80,9 +80,9 @@ def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_
         return loss_scale.scale(loss), loss
 
     def sum_grads(grads, x):
-        input_, target, i = x
+        input_, target, mini_step = x
         curr_grads, loss = jax.grad(loss_fn, has_aux=True)(params_compute, input_, target)
-        welford_update = lambda acc, new: acc + (new - acc) / (i + 1)
+        welford_update = lambda acc, new: acc + (new - acc) / (mini_step + 1)
         new_grads = jax.tree_map(welford_update, grads, curr_grads)
         return new_grads, loss
 
