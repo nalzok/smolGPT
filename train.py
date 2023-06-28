@@ -49,16 +49,20 @@ def randomize(params, n_layer, policy):
         path_hash = int(sha1(path_bytes).hexdigest(), 16) % maxsize
         leaf_key = jax.random.PRNGKey(path_hash)
 
-        noise = jax.random.normal(leaf_key, leaf.shape, policy.param_dtype)
-        if path[-1].key in {"wpe", "wte"}:
-            return noise * 0.02
-        elif path[-1].key == "b":
-            return jnp.zeros_like(noise)
-        elif path[-1].key in {"w", "g"}:
+        if path[-1].key == "b":                 # bias
+            return jnp.zeros_like(leaf)
+        elif path[-1].key == "g":               # layer norm
+            return jnp.ones_like(leaf)
+        elif path[-1].key == "w":               # linear
+            noise = jax.random.normal(leaf_key, leaf.shape, policy.param_dtype)
             if path[-2].key == "c_proj":
-                return noise * 0.02/jnp.sqrt(2*n_layer)
+                std = 0.02/jnp.sqrt(2*n_layer)
             else:
-                return noise * 0.02
+                std = 0.02
+            return noise * std
+        elif path[-1].key in {"wpe", "wte"}:    # embedding
+            noise = jax.random.normal(leaf_key, leaf.shape, policy.param_dtype)
+            return noise * 0.02
         else:
             raise ValueError(f"Unknown path {path}")
 
@@ -67,13 +71,13 @@ def randomize(params, n_layer, policy):
     return params
 
 
-@partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(5, 6, 7), donate_argnums=(0, 1, 2))
-def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform, policy):
+@partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(5, 6), donate_argnums=(0, 1, 2))
+def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform):
 
     def loss_fn(p, input_, target):
         logits = gpt2(input_, **p, n_head=n_head)
         losses = optax.softmax_cross_entropy_with_integer_labels(logits, target)
-        loss = jnp.mean(losses)
+        loss = jnp.mean(losses) / inputs.shape[0]
         return loss_scale.scale(loss), loss
 
     def sum_grads(grads, x):
@@ -88,10 +92,9 @@ def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_
     grads, losses = jax.lax.scan(sum_grads, init, xs)
     loss = jnp.mean(losses)
 
-    grads = loss_scale.unscale(grads)
-    grads = policy.cast_to_compute(grads)
     grads = jax.lax.pmean(grads, axis_name="batch")
-    grads = policy.cast_to_param(grads)
+    grads = loss_scale.unscale(grads)
+    grads_norm = optax.global_norm(grads)
 
     updates, new_opt_state = gradient_transform.update(grads, opt_state, params)
     new_params = optax.apply_updates(params, updates)
@@ -104,7 +107,7 @@ def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_
         (new_params, new_opt_state),
         (params, opt_state))
 
-    return new_params, new_opt_state, new_loss_scale, loss, grads_finite, grads
+    return new_params, new_opt_state, new_loss_scale, loss, grads_norm
 
 
 def train(params,
@@ -136,29 +139,31 @@ def train(params,
             optax.scale(-1.0),
     )
     opt_state = gradient_transform.init(params)
-    loss_scale = jmp.DynamicLossScale(jnp.array(2. ** 16, dtype=policy.param_dtype))
+    if policy.compute_dtype is jnp.float32:
+        loss_scale = jmp.NoOpLossScale()
+    else:
+        loss_scale = jmp.DynamicLossScale(jnp.array(2. ** 16, dtype=policy.param_dtype))
 
     params, opt_state, loss_scale = replicate((params, opt_state, loss_scale))
     dataloader = islice(zip(tr, va), max_iter)
 
     for (inputs, targets), _ in (pbar := tqdm(dataloader, "Training")):
-        params, opt_state, loss_scale, loss, grads_finite, grads \
-                = train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform, policy)
+        params, opt_state, loss_scale, loss, grads_norm \
+                = train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform)
         _, _, _, schedule_state, _ = opt_state
         step = int(unreplicate(schedule_state.count))
         lr = float(scheduler(step))
         scale = float(unreplicate(loss_scale).loss_scale)
         loss = float(jnp.mean(loss))
-        grads_finite = float(unreplicate(grads_finite))
+        grads_norm = float(unreplicate(grads_norm))
 
-        pbar.set_description(f"{scale = }, {lr = }, {loss = }, {grads_finite = }")
+        pbar.set_description(f"{scale = }, {lr = }, {loss = }, {grads_norm = }")
         wandb.log({
             "step": step,
             "lr": lr,
             "scale": scale,
             "loss": loss,
-            "norm": float(optax.global_norm(unreplicate(grads))),
-            "grads_finite": grads_finite,
+            "norm": grads_norm,
         })
 
     return unreplicate(params)
@@ -178,7 +183,7 @@ def main(model_size: str = "124M",
          warmup_iters: int = 2000,
          lr_decay_iters: int = 600000,
          min_lr: float = 6e-5,
-         jmp_policy: str = "params=float32,compute=float16,output=float32"):
+         jmp_policy: str = "params=float32,compute=bfloat16,output=float32"):
     config = locals()
     encoder, hparams, params = load_encoder_hparams_and_params(model_size, models_dir)
     context_length = hparams["n_ctx"]
