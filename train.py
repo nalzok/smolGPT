@@ -66,13 +66,13 @@ def randomize(params, n_layer, policy):
         else:
             raise ValueError(f"Unknown path {path}")
 
+    # not doing gradient tying because that doesn't seem to help
     params = jax.tree_util.tree_map_with_path(init_param, params)
-    # TODO: gradient tying
     return params
 
 
-@partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(5, 6), donate_argnums=(0, 1, 2))
-def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform):
+@partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(5, 6, 7), donate_argnums=(0, 1, 2))
+def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform, policy):
 
     def loss_fn(p, input_, target):
         logits = gpt2(input_, **p, n_head=n_head)
@@ -82,16 +82,19 @@ def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_
 
     def sum_grads(grads, x):
         input_, target = x
-        curr_grads, loss = jax.grad(loss_fn, has_aux=True)(params, input_, target)
+        curr_grads, loss = jax.grad(loss_fn, has_aux=True)(params_compute, input_, target)
         new_grads = jax.tree_map(add, grads, curr_grads)
         return new_grads, loss
 
     # use map/scan-over-grad instead of grad-over-map/scan to reduce memory consumption
-    init = jax.tree_map(jnp.zeros_like, params)
+    params_compute = policy.cast_to_compute(params)
+    init = jax.tree_map(jnp.zeros_like, params_compute)
     xs = (inputs, targets)
     grads, losses = jax.lax.scan(sum_grads, init, xs)
-    loss = jnp.mean(losses)
+    losses = policy.cast_to_output(losses)
+    loss = jnp.sum(losses)
 
+    grads = policy.cast_to_param(grads)
     grads = jax.lax.pmean(grads, axis_name="batch")
     grads = loss_scale.unscale(grads)
     grads_norm = optax.global_norm(grads)
@@ -149,7 +152,7 @@ def train(params,
 
     for (inputs, targets), _ in (pbar := tqdm(dataloader, "Training")):
         params, opt_state, loss_scale, loss, grads_norm \
-                = train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform)
+                = train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform, policy)
         _, _, _, schedule_state, _ = opt_state
         step = int(unreplicate(schedule_state.count))
         lr = float(scheduler(step))
