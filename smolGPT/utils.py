@@ -10,7 +10,7 @@ import requests
 import tensorflow as tf
 from tqdm import tqdm
 
-from encoder import get_encoder
+from smolGPT.encoder import get_encoder
 
 
 def download_gpt2_files(model_size, model_dir):

@@ -13,8 +13,8 @@ from tqdm import tqdm
 import fire
 import wandb
 
-from gpt2 import gpt2
-from utils import load_encoder_hparams_and_params, replicate, unreplicate
+from smolGPT.model import gpt2
+from smolGPT.utils import load_encoder_hparams_and_params, replicate, unreplicate
 
 
 class DataLoader:

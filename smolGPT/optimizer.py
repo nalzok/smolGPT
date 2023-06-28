@@ -3,7 +3,7 @@ from typing import NamedTuple, Optional
 import optax
 import chex
 
-from utils import canonicalize_dtype
+from smolGPT.utils import canonicalize_dtype
 
 
 class ScaleBySketchySGDState(NamedTuple):
