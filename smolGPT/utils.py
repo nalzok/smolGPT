@@ -90,7 +90,12 @@ def replicate(tree):
 
 
 def unreplicate(tree):
-    return jax.tree_util.tree_map(lambda x: x[0], tree)
+    return jax.tree_map(lambda x: x[0], tree)
+
+
+def is_penultimate(tree):
+    children = jax.tree_util.tree_structure(tree).children()
+    return all(jax.tree_util.treedef_is_leaf(treedef) for treedef in children)
 
 
 def canonicalize_dtype(dtype: Optional[chex.ArrayDType]) -> Optional[chex.ArrayDType]:

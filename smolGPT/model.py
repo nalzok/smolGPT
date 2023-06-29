@@ -8,8 +8,12 @@ def layer_norm(x, g, b, eps: float = 1e-5):
     return g * (x - mean) / jnp.sqrt(variance + eps) + b
 
 
-def linear(x, w, b):
-    return x @ w + b
+def linear(x, w, b, uv):
+    if uv is None:
+        return x @ w + b
+
+    u, v = uv
+    return x @ w + x @ u @ v + b
 
 
 def ffn(x, c_fc, c_proj):

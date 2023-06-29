@@ -1,3 +1,4 @@
+from typing import Optional
 from pathlib import Path
 from functools import partial
 from itertools import islice
@@ -14,7 +15,7 @@ import fire
 import wandb
 
 from smolGPT.model import gpt2
-from smolGPT.utils import load_encoder_hparams_and_params, replicate, unreplicate
+from smolGPT.utils import load_encoder_hparams_and_params, replicate, unreplicate, is_penultimate
 
 
 class DataLoader:
@@ -41,40 +42,76 @@ class DataLoader:
         return x, y
 
 
-def randomize(params, n_layer, policy):
+def randomize_params(params, n_layer):
     # See https://github.com/karpathy/nanoGPT/blob/4eb7a96b077998f28b57938c2f1e511b0d8cab7c/model.py#L140-L145
-    def init_param(path, leaf):
-        path_bytes = ".".join(str(p) for p in path).encode("utf-8")
+    def randomize(path, leaf):
+        path_bytes = "".join(str(p) for p in path).encode()
         path_hash = int(sha1(path_bytes).hexdigest(), 16) % maxsize
-        leaf_key = jax.random.PRNGKey(path_hash)
+        key_leaf = jax.random.PRNGKey(path_hash)
 
         if path[-1].key == "b":                 # bias
             return jnp.zeros_like(leaf)
         elif path[-1].key == "g":               # layer norm
             return jnp.ones_like(leaf)
-        elif path[-1].key == "w":               # linear
-            noise = jax.random.normal(leaf_key, leaf.shape, policy.param_dtype)
+        elif path[-1].key == "w":               # mlp/attention
+            noise = jax.random.normal(key_leaf, leaf.shape, leaf.dtype)
             if path[-2].key == "c_proj":
                 std = 0.02/jnp.sqrt(2*n_layer)
             else:
                 std = 0.02
-            return noise * std
+            return std * noise
         elif path[-1].key in {"wpe", "wte"}:    # embedding
-            noise = jax.random.normal(leaf_key, leaf.shape, policy.param_dtype)
-            return noise * 0.02
+            noise = jax.random.normal(key_leaf, leaf.shape, leaf.dtype)
+            return 0.02 * noise
         else:
             raise ValueError(f"Unknown path {path}")
 
     # not doing gradient tying because that doesn't seem to help
-    params = jax.tree_util.tree_map_with_path(init_param, params)
+    params = jax.tree_util.tree_map_with_path(randomize, params)
     return params
 
 
-@partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(5, 6, 7), donate_argnums=(0, 1, 2))
-def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform, policy):
+def inject_uv(params):
+    def inject(path, leaf):
+        if path[-1].key in {"c_fc", "c_proj", "c_attn"}:               # mlp/attention
+            return {**leaf, "uv": None}
+        else:
+            return leaf
+
+    params = jax.tree_util.tree_map_with_path(inject, params, is_leaf=is_penultimate)
+    return params
+
+
+def init_lora(params, lora_rank):
+    def init(path, leaf):
+        if isinstance(leaf, np.ndarray) or isinstance(leaf, jax.Array):
+            return None
+
+        path_bytes = "".join(str(p) for p in path).encode()
+        path_hash = int(sha1(path_bytes).hexdigest(), 16) % maxsize
+        key_leaf = jax.random.PRNGKey(path_hash)
+
+        null = {k: None for k in leaf}
+        if path[-1].key in {"c_attn", "c_fc", "c_proj"}:               # mlp/attention
+            w = leaf["w"]
+            key_u, key_v = jax.random.split(key_leaf)
+            u = 0.02 * jax.random.normal(key_u, (w.shape[0], lora_rank), w.dtype)
+            v = 0.02 * jax.random.normal(key_v, (lora_rank, w.shape[1]), w.dtype)
+            return {**null, "uv": (u, v)}
+        else:
+            return null
+
+    params = jax.tree_util.tree_map_with_path(init, params, is_leaf=is_penultimate)
+    return params
+
+
+@partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(6, 7, 8), donate_argnums=(0, 1, 2))
+def train_step(params, opt_state, loss_scale, frozen, inputs, targets, n_head, gradient_transform, policy):
 
     def loss_fn(p, input_, target):
-        logits = gpt2(input_, **p, n_head=n_head)
+        merged = jax.tree_map(lambda a, b: a if a is not None else b,
+                              frozen, p, is_leaf=lambda x: x is None)
+        logits = gpt2(input_, **merged, n_head=n_head)
         losses = optax.softmax_cross_entropy_with_integer_labels(logits, target)
         loss = jnp.mean(losses)
         return loss_scale.scale(loss), loss
@@ -114,6 +151,7 @@ def train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_
 
 
 def train(params,
+          frozen,
           tr,
           va,
           n_head,
@@ -147,12 +185,12 @@ def train(params,
     else:
         loss_scale = jmp.DynamicLossScale(jnp.array(2. ** 16, dtype=policy.param_dtype))
 
-    params, opt_state, loss_scale = replicate((params, opt_state, loss_scale))
+    params, frozen, opt_state, loss_scale = replicate((params, frozen, opt_state, loss_scale))
     dataloader = islice(zip(tr, va), max_iter)
 
     for (inputs, targets), _ in (pbar := tqdm(dataloader, "Training")):
         params, opt_state, loss_scale, loss, grads_norm \
-                = train_step(params, opt_state, loss_scale, inputs, targets, n_head, gradient_transform, policy)
+                = train_step(params, opt_state, loss_scale, frozen, inputs, targets, n_head, gradient_transform, policy)
         _, _, _, schedule_state, _ = opt_state
         step = int(unreplicate(schedule_state.count))
         lr = float(scheduler(step))
@@ -175,6 +213,8 @@ def train(params,
 def main(model_size: str = "124M",
          models_dir: str = "models",
          data_dir: str = "data/openwebtext",
+         finetune: bool = True,
+         lora_rank: Optional[int] = 1,
          gradient_accumulation: int = 5 * 8,
          batch_size: int = 12,
          learning_rate: float = 6e-4,
@@ -187,6 +227,10 @@ def main(model_size: str = "124M",
          lr_decay_iters: int = 600000,
          min_lr: float = 6e-5,
          jmp_policy: str = "params=float32,compute=bfloat16,output=float32"):
+
+    if not finetune and lora_rank is not None:
+        raise ValueError("You cannot train a LoRA model from scratch")
+
     config = locals()
     encoder, hparams, params = load_encoder_hparams_and_params(model_size, models_dir)
     context_length = hparams["n_ctx"]
@@ -198,10 +242,20 @@ def main(model_size: str = "124M",
     va = DataLoader(data_path/"val.bin", context_length, gradient_accumulation, batch_size)
 
     policy = jmp.get_policy(jmp_policy)
+    params = policy.cast_to_param(params)
+
+    if not finetune:
+        params = randomize_params(params, n_layer)
+
+    params = inject_uv(params)
+    if lora_rank is not None:
+        frozen, params = params, init_lora(params, lora_rank)
+    else:
+        frozen, params = {}, params
 
     wandb.init(project="smolGPT", config=config)
-    params = randomize(params, n_layer, policy)
     params = train(params,
+                   frozen,
                    tr,
                    va,
                    n_head,
