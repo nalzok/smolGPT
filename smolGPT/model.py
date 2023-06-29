@@ -13,7 +13,7 @@ def linear(x, w, b, uv):
         return x @ w + b
 
     u, v = uv
-    return x @ w + x @ u @ v + b
+    return x @ w + (x @ u) @ v + b
 
 
 def ffn(x, c_fc, c_proj):
