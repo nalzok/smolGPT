@@ -251,7 +251,7 @@ def main(model_size: str = "124M",
     if lora_rank is not None:
         frozen, params = params, init_lora(params, lora_rank)
     else:
-        frozen, params = {}, params
+        frozen, params = jax.tree_map(lambda _: None, params), params
 
     wandb.init(project="smolGPT", config=config)
     params = train(params,
