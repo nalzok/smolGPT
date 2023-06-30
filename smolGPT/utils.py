@@ -5,6 +5,7 @@ import re
 
 import numpy as np
 import jax
+import jax.numpy as jnp
 import chex
 import requests
 import tensorflow as tf
@@ -98,7 +99,20 @@ def is_penultimate(tree):
     return all(jax.tree_util.treedef_is_leaf(treedef) for treedef in children)
 
 
+# forward-over-reverse
+def hvp(f, primals, tangents):
+    primals_out, tangents_out = jax.jvp(jax.grad(f), primals, tangents)
+    return tangents_out
+
+
 def canonicalize_dtype(dtype: Optional[chex.ArrayDType]) -> Optional[chex.ArrayDType]:
     if dtype is not None:
         return jax.dtypes.canonicalize_dtype(dtype)
     return dtype
+
+
+def safe_int32_increment(count: chex.Numeric) -> chex.Numeric:
+    chex.assert_type(count, jnp.int32)
+    max_int32_value = jnp.iinfo(jnp.int32).max
+    one = jnp.array(1, dtype=jnp.int32)
+    return jnp.where(count < max_int32_value, count + one, max_int32_value)
