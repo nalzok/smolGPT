@@ -4,23 +4,21 @@ MAKEFLAGS = --warn-undefined-variables
 
 .PHONY: nvitop generate train
 
-requirements.txt: requirements.in
-	.venv/bin/python3.10 -m piptools compile \
-		--pip-args="-f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html" \
-		--resolver=backtracking
-
-.venv: requirements.txt
+.venv:
 	python3.10 -m venv .venv
-	.venv/bin/python3.10 -m pip install --upgrade pip setuptools wheel build
-	.venv/bin/python3.10 -m pip install pip-tools
-	.venv/bin/python3.10 -m piptools sync
+	.venv/bin/python3.10 -m pip install --upgrade pip setuptools wheel build pip-tools
 	touch .venv
 
-nvitop: .venv
+requirements.txt: .venv requirements.in
+	.venv/bin/python3.10 -m piptools compile \
+		--pip-args="-f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
+	.venv/bin/python3.10 -m piptools sync
+
+nvitop: requirements.txt
 	.venv/bin/python3.10 -m nvitop
 
-generate: .venv
+generate: requirements.txt
 	.venv/bin/python3.10 -m gpt2 "Alan Turing theorized that computers would one day become"
 
-train: .venv
+train: requirements.txt
 	.venv/bin/python3.10 -m train

@@ -4,7 +4,7 @@ requests
 tqdm
 fire
 tensorflow-cpu
-jax[cuda11_pip]
+jax[cuda12_pip]
 jmp
 optax
 chex
