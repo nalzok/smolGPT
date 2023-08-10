@@ -265,6 +265,9 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
     s = jax.tree_map(lambda x: x[0], su, is_leaf=lambda x: isinstance(x, tuple))
     u = jax.tree_map(lambda x: x[1], su, is_leaf=lambda x: isinstance(x, tuple))
 
+    s_norm = optax.global_norm(s)
+    u_norm = optax.global_norm(u)
+
     count_inc = safe_int32_increment(sketchy_state.count)
     new_sketchy_state = sketchy_state._replace(
         count=count_inc, s=s, u=u,
@@ -305,7 +308,7 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
         (new_params, new_opt_state, new_sketchy_state),
         (params, opt_state, sketchy_state))
 
-    return new_params, new_opt_state, new_sketchy_state, new_loss_scale, loss, grads_norm, hvps_norm
+    return new_params, new_opt_state, new_sketchy_state, new_loss_scale, loss, grads_norm, hvps_norm, s_norm, u_norm
 
 
 def train(params,
@@ -356,7 +359,7 @@ def train(params,
     dataloader = islice(zip(tr, va), max_iter)
 
     for (inputs, targets), _ in (pbar := tqdm(dataloader, "Training")):
-        params, opt_state, sketchy_state, loss_scale, loss, grads_norm, hvps_norm \
+        params, opt_state, sketchy_state, loss_scale, loss, grads_norm, hvps_norm, s_norm, u_norm \
                 = train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, targets, n_head, gradient_transform, policy)
         _, _, _, schedule_state, _ = opt_state
         step = int(unreplicate(schedule_state.count))
@@ -365,8 +368,11 @@ def train(params,
         loss = float(jnp.mean(loss))
         grads_norm = float(unreplicate(grads_norm))
         hvps_norm = float(unreplicate(hvps_norm))
+        s_norm = float(unreplicate(s_norm))
+        u_norm = float(unreplicate(u_norm))
 
-        pbar.set_description(f"{scale = }, {lr = :.3}, {loss = :.3}, {grads_norm = :.3}, {hvps_norm = :.3}")
+        pbar.set_description(f"{scale = }, {lr = :.3}, {loss = :.3}, "
+                             f"{grads_norm = :.3}, {hvps_norm = :.3}, {s_norm = :.3}, {u_norm = :.3}")
         wandb.log({
             "step": step,
             "lr": lr,
@@ -374,6 +380,8 @@ def train(params,
             "loss": loss,
             "grads_norm": grads_norm,
             "hvps_norm": hvps_norm,
+            "s_norm": s_norm,
+            "u_norm": u_norm,
         })
 
     return unreplicate(params)
