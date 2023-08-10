@@ -7,6 +7,7 @@ from sys import maxsize
 
 import jax
 import jax.numpy as jnp
+import jax.flatten_util     # suppress warning
 import jmp
 import optax
 import numpy as np
@@ -233,9 +234,18 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
         hvp = jnp.reshape(hvp, (r, p))
         omg = jnp.reshape(omg, (r, p))
 
-        regularizer = (jnp.sqrt(p) * jnp.finfo(hvp.dtype).eps).astype(hvp.dtype)
-        hvp_reg = hvp + regularizer * omg
-        quad = (omg @ hvp_reg.T).astype(jnp.float32)    # jnp.linalg.{cholesky,svd} does not support bfloat16
+        def cond_fun(reg):
+            hvp_reg = hvp + reg * omg
+            quad = (omg @ hvp_reg.T).astype(jnp.float32)    # jnp.linalg.{cholesky,svd} does not support bfloat16
+            l = jnp.linalg.cholesky(quad)
+            return jnp.any(jnp.isnan(l))
+
+        def body_fun(reg):
+            return 2 * reg
+
+        regularizer = jax.lax.while_loop(cond_fun, body_fun, jnp.finfo(hvp.dtype).eps)
+        hvp = hvp + regularizer * omg
+        quad = (omg @ hvp.T).astype(jnp.float32)    # jnp.linalg.{cholesky,svd} does not support bfloat16
         l = jnp.linalg.cholesky(quad)
         b = jax.scipy.linalg.solve_triangular(l, hvp, lower=True).T
 
@@ -265,7 +275,8 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
     s = jax.tree_map(lambda x: x[0], su, is_leaf=lambda x: isinstance(x, tuple))
     u = jax.tree_map(lambda x: x[1], su, is_leaf=lambda x: isinstance(x, tuple))
 
-    s_norm = optax.global_norm(s)
+    s_max_norm = optax.global_norm(jax.tree_map(lambda x: x[0], s))
+    s_min_norm = optax.global_norm(jax.tree_map(lambda x: x[-1], s))
     u_norm = optax.global_norm(u)
 
     count_inc = safe_int32_increment(sketchy_state.count)
@@ -279,20 +290,27 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
         grad = jnp.reshape(grad, (p,))
         u = jnp.reshape(u, (r, p))
 
+        # Precondition with the Woodbury formula, equivalent to
+        #   precond = jnp.linalg.solve(u.T @ jnp.diag(s) @ u + rho * jnp.eye(grad.shape[0]), grad)
         rho = sketchy_state.rho
         u_grad = u @ grad
         precond = u.T / (s + rho) @ u_grad + (grad - u.T @ u_grad) / rho
-        precond = jnp.reshape(precond, shape)
 
+        precond = jnp.reshape(precond, shape)
         return precond
 
-    preconditioned = jax.tree_util.tree_map(precondition, grads, s, u)
-    # preconditioned = grads
+    import os
+    if int(os.environ["PRECONDITION"]):
+        preconditioned = jax.tree_util.tree_map(precondition, grads, s, u)
+    else:
+        preconditioned = grads
 
-    # def cosine(x, y):
-    #     x, y = jnp.reshape(x, -1), jnp.reshape(y, -1)
-    #     return x @ y / jnp.sqrt((x @ x) * (y @ y))
-    # jax.debug.print("cosine: {}", jax.tree_map(cosine, preconditioned, grads))
+    precond_norm = optax.global_norm(preconditioned)
+
+    x, _ = jax.flatten_util.ravel_pytree(preconditioned)
+    y, _ = jax.flatten_util.ravel_pytree(grads)
+    dist_cos = jnp.dot(x, y) / jnp.linalg.norm(x) / jnp.linalg.norm(y)
+    dist_euc = jnp.linalg.norm(x - y)
 
     # TODO: implement automatic learning rate
     updates, new_opt_state = gradient_transform.update(preconditioned, opt_state, params_compute,
@@ -308,7 +326,8 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
         (new_params, new_opt_state, new_sketchy_state),
         (params, opt_state, sketchy_state))
 
-    return new_params, new_opt_state, new_sketchy_state, new_loss_scale, loss, grads_norm, hvps_norm, s_norm, u_norm
+    return new_params, new_opt_state, new_sketchy_state, new_loss_scale, loss, \
+            grads_norm, hvps_norm, s_max_norm, s_min_norm, u_norm, precond_norm, dist_cos, dist_euc
 
 
 def train(params,
@@ -348,7 +367,7 @@ def train(params,
     # include accumulation (e.g. moving average), so they cannot benefit
     # from being stored in high precision. As a result, we store them
     # as policy.compute_dtype.
-    sketchy_state = create_sketchy_state(key, params, rank=sketchy_rank, rho=0.01, update_freq=2, precond_dtype=policy.compute_dtype)
+    sketchy_state = create_sketchy_state(key, params, rank=sketchy_rank, rho=0.01, update_freq=32, precond_dtype=policy.compute_dtype)
 
     if policy.compute_dtype is jnp.float32:
         loss_scale = jmp.NoOpLossScale()
@@ -359,7 +378,8 @@ def train(params,
     dataloader = islice(zip(tr, va), max_iter)
 
     for (inputs, targets), _ in (pbar := tqdm(dataloader, "Training")):
-        params, opt_state, sketchy_state, loss_scale, loss, grads_norm, hvps_norm, s_norm, u_norm \
+        params, opt_state, sketchy_state, loss_scale, loss, grads_norm, hvps_norm, \
+                s_max_norm, s_min_norm, u_norm, precond_norm, dist_cos, dist_euc \
                 = train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, targets, n_head, gradient_transform, policy)
         _, _, _, schedule_state, _ = opt_state
         step = int(unreplicate(schedule_state.count))
@@ -368,21 +388,28 @@ def train(params,
         loss = float(jnp.mean(loss))
         grads_norm = float(unreplicate(grads_norm))
         hvps_norm = float(unreplicate(hvps_norm))
-        s_norm = float(unreplicate(s_norm))
+        s_max_norm = float(unreplicate(s_max_norm))
+        s_min_norm = float(unreplicate(s_min_norm))
         u_norm = float(unreplicate(u_norm))
+        precond_norm = float(unreplicate(precond_norm))
+        dist_cos = float(unreplicate(dist_cos))
+        dist_euc = float(unreplicate(dist_euc))
 
-        pbar.set_description(f"{scale = }, {lr = :.3}, {loss = :.3}, "
-                             f"{grads_norm = :.3}, {hvps_norm = :.3}, {s_norm = :.3}, {u_norm = :.3}")
+        pbar.set_description(f"{loss = :.3}, {grads_norm = :.3}, {precond_norm = :.3}, "
+                             f"{s_max_norm = :.3}, {s_min_norm = :.3}, {dist_cos = :.3}")
         wandb.log({
-            "step": step,
             "lr": lr,
             "scale": scale,
             "loss": loss,
             "grads_norm": grads_norm,
             "hvps_norm": hvps_norm,
-            "s_norm": s_norm,
+            "s_max_norm": s_max_norm,
+            "s_min_norm": s_min_norm,
             "u_norm": u_norm,
-        })
+            "precond_norm": precond_norm,
+            "dist_cos": dist_cos,
+            "dist_euc": dist_euc,
+        }, step)
 
     return unreplicate(params)
 
@@ -393,7 +420,7 @@ def main(model_size: str = "124M",
          finetune: bool = True,
          lora_rank: Optional[int] = 1,
          sketchy_rank: int = 5,
-         gradient_accumulation: int = 2,
+         gradient_accumulation: int = 1,
          batch_size: int = 1,
          learning_rate: float = 6e-4,
          max_iter: int = 600000,
