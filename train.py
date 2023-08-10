@@ -50,7 +50,7 @@ class DataLoader:
 
 
 def randomize_params(params, n_layer):
-    # See https://github.com/karpathy/nanoGPT/blob/4eb7a96b077998f28b57938c2f1e511b0d8cab7c/model.py#L140-L145
+    # see https://github.com/karpathy/nanoGPT/blob/4eb7a96b077998f28b57938c2f1e511b0d8cab7c/model.py#L140-L145
     def randomize(path, leaf):
         path_bytes = "".join(str(p) for p in path).encode()
         path_hash = int(sha1(path_bytes).hexdigest(), 16) % maxsize
@@ -80,8 +80,10 @@ def randomize_params(params, n_layer):
 
 def inject_uv(params):
     def inject(path, leaf):
-        if path[-1].key in {"c_fc", "c_proj", "c_attn"}:               # mlp/attention
-            return {**leaf, "uv": None}
+        # FIXME: we want to train the biases as well (actually no?)
+        # FIXME: split c_attn into w_q, w_k and w_v (but ignore the multi-head thing)
+        if path[-1].key in {"c_attn", "c_proj"} and path[-2].key == "attn":
+            return {**leaf, "u": None, "v": None}
         else:
             return leaf
 
@@ -99,12 +101,11 @@ def init_lora(params, lora_rank):
         key_leaf = jax.random.PRNGKey(path_hash)
 
         null = {k: None for k in leaf}
-        if path[-1].key in {"c_attn", "c_fc", "c_proj"}:               # mlp/attention
+        if path[-1].key in {"c_attn", "c_proj"} and path[-2].key == "attn":
             w = leaf["w"]
-            key_u, key_v = jax.random.split(key_leaf)
-            u = 0.02 * jax.random.normal(key_u, (w.shape[0], lora_rank), w.dtype)
-            v = 0.02 * jax.random.normal(key_v, (lora_rank, w.shape[1]), w.dtype)
-            return {**null, "uv": (u, v)}
+            u = 1./lora_rank * jax.random.normal(key_leaf, (w.shape[0], lora_rank), w.dtype)
+            v = jnp.zeros((lora_rank, w.shape[1]), w.dtype)
+            return {**null, "u": u, "v": v}
         else:
             return null
 
@@ -121,13 +122,24 @@ class SketchySGDState(NamedTuple):
     u: jax.Array
 
 
-def create_sketchy_state(key, params, rank = 1, rho = 0.01, update_freq = 1, precond_dtype = None):
+def create_sketchy_state(key, params, rank, rho, update_freq, precond_dtype):
     precond_dtype = canonicalize_dtype(precond_dtype)
-    s = jax.tree_util.tree_map(  # Eigenvalues
-        lambda x: jnp.empty_like(x, dtype=precond_dtype), params)
-    u = jax.tree_util.tree_map(  # Eigenvectors
-        lambda x: jax.random.normal(key, (rank, *x.shape), dtype=precond_dtype or x.dtype), params)
-    # TODO: orthogonalize u with QR (and jax.flatten_util.ravel_pytree if we want to precondition jointly)
+
+    # eigenvalues
+    s = jax.tree_util.tree_map(lambda x: jnp.zeros(rank, dtype=precond_dtype or x.dtype), params)
+
+    def random_orthogonal(x):
+        # NOTE: use jax.flatten_util.ravel_pytree if we want to precondition jointly
+        p = np.prod(x.shape, dtype=int)
+        rand = jax.random.normal(key, (p, rank), dtype=jnp.float32)
+        q, _ = jnp.linalg.qr(rand)  # jnp.linalg.qr does not support bfloat16
+        q = q.astype(precond_dtype or x.dtype)
+        q = jnp.reshape(q.T, (rank, *x.shape))
+        return q
+
+    # eigenvectors
+    u = jax.tree_util.tree_map(random_orthogonal, params)
+
     rho = jnp.array(rho, precond_dtype)
     update_freq = jnp.array(update_freq, jnp.int32)
     count = jnp.zeros([], jnp.int32)
@@ -158,20 +170,42 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
         grads, hvps = grads_hvps
         input_, target, mini_step = x
         grad_fn = lambda p: jax.grad(loss_fn, has_aux=True)(p, input_, target)
-        hvp_fn = lambda u: jax.jvp(grad_fn, (params_compute,), (u,), has_aux=True)
-        curr_grads, curr_hvps, loss = jax.lax.map(hvp_fn, sketchy_state.u)
+        hvp_fn = lambda o: jax.jvp(grad_fn, (params_compute,), (o,), has_aux=True)
+        curr_grads, curr_hvps, loss = jax.lax.map(hvp_fn, omega)
         curr_grads, loss = unreplicate((curr_grads, loss))
         welford_update = lambda acc, new: acc + (new - acc) / (mini_step + 1)
         new_grads = jax.tree_map(welford_update, grads, curr_grads)
         new_hvps = jax.tree_map(welford_update, hvps, curr_hvps)
         return (new_grads, new_hvps), loss
 
-    params_compute, inputs, targets = policy.cast_to_compute((params, inputs, targets))
+    def random_orthogonal(x):
+        # NOTE: use jax.flatten_util.ravel_pytree if we want to precondition jointly
+        _, _, _, schedule_state, _ = opt_state
+        key = jax.random.PRNGKey(schedule_state.count)
+        r, *shape = x.shape
+        p = np.prod(shape, dtype=int)
+        rand = jax.random.normal(key, (p, r), dtype=jnp.float32)
+        q, _ = jnp.linalg.qr(rand)  # jnp.linalg.qr does not support bfloat16
+        q = q.astype(x.dtype)
+        q = jnp.reshape(q.T, (r, *shape))
+        return q
 
-    # use map/scan-over-grad instead of grad-over-map/scan to reduce memory consumption
+    omega = jax.lax.cond(
+        sketchy_state.count % sketchy_state.update_freq == 0,
+        lambda: jax.tree_util.tree_map(random_orthogonal, sketchy_state.u),
+        lambda: jax.tree_util.tree_map(jnp.zeros_like, sketchy_state.u)
+    )
+
+    # alternatively, do power iteration:
+    # omega = sketchy_state.u
+
+    params_compute, omega, inputs, targets = policy.cast_to_compute((params, omega, inputs, targets))
+
     init = (jax.tree_map(jnp.zeros_like, params_compute),
-            jax.tree_map(jnp.zeros_like, sketchy_state.u))
+            jax.tree_map(jnp.zeros_like, omega))
     xs = (inputs, targets, jnp.arange(inputs.shape[0]))
+
+    # using map/scan-over-grad instead of grad-over-map/scan to reduce memory consumption
     (grads, hvps), losses = jax.lax.cond(
         sketchy_state.count % sketchy_state.update_freq == 0,
         lambda i, x: jax.lax.scan(avg_grads_hvps, i, x),
@@ -191,14 +225,74 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
     hvps = loss_scale.unscale(hvps)
     hvps_norm = optax.global_norm(hvps)
 
+    # Nystrom approximation
+    def estimate_hessian(hvp, omg):
+        # TODO: instead of reshaping weight matrices into vectors, can we precondition each row/column separately?
+        r, *shape = hvp.shape
+        p = np.prod(shape, dtype=int)
+        hvp = jnp.reshape(hvp, (r, p))
+        omg = jnp.reshape(omg, (r, p))
+
+        regularizer = (jnp.sqrt(p) * jnp.finfo(hvp.dtype).eps).astype(hvp.dtype)
+        hvp_reg = hvp + regularizer * omg
+        quad = (omg @ hvp_reg.T).astype(jnp.float32)    # jnp.linalg.{cholesky,svd} does not support bfloat16
+        l = jnp.linalg.cholesky(quad)
+        b = jax.scipy.linalg.solve_triangular(l, hvp, lower=True).T
+
+        # use host callback when CUDA runs out of memory for large p
+        #
+        u, sigma, _ = jnp.linalg.svd(b, full_matrices=False)
+
+        # result_shape = (jax.ShapeDtypeStruct((p, r), b.dtype),
+        #                 jax.ShapeDtypeStruct((r,), b.dtype),
+        #                 jax.ShapeDtypeStruct((r, r), b.dtype))
+        # u, sigma, _ = jax.pure_callback(partial(np.linalg.svd, full_matrices=False), result_shape, b)
+
+        u = u.astype(hvp.dtype)
+        sigma = sigma.astype(hvp.dtype)
+
+        s = jnp.maximum(0, sigma**2 - regularizer).T
+        u = jnp.reshape(u.T, (r, *shape))
+
+        return s, u
+
+    # only update s and u when (count % update_freq) == 0
+    su = jax.lax.cond(
+        sketchy_state.count % sketchy_state.update_freq == 0,
+        lambda: jax.tree_map(estimate_hessian, policy.cast_to_compute(hvps), omega),
+        lambda: jax.tree_map(lambda s, u: (s, u), sketchy_state.s, sketchy_state.u),
+    )
+    s = jax.tree_map(lambda x: x[0], su, is_leaf=lambda x: isinstance(x, tuple))
+    u = jax.tree_map(lambda x: x[1], su, is_leaf=lambda x: isinstance(x, tuple))
+
     count_inc = safe_int32_increment(sketchy_state.count)
     new_sketchy_state = sketchy_state._replace(
-        count=count_inc,
-        s=policy.cast_to_compute(grads),    # placeholder
-        u=policy.cast_to_compute(jax.tree_map(lambda x: x/hvps_norm, hvps)),
+        count=count_inc, s=s, u=u,
     )
 
-    updates, new_opt_state = gradient_transform.update(grads, opt_state, params_compute,
+    def precondition(grad, s, u):
+        r, *shape = u.shape
+        p = np.prod(shape, dtype=int)
+        grad = jnp.reshape(grad, (p,))
+        u = jnp.reshape(u, (r, p))
+
+        rho = sketchy_state.rho
+        u_grad = u @ grad
+        precond = u.T / (s + rho) @ u_grad + (grad - u.T @ u_grad) / rho
+        precond = jnp.reshape(precond, shape)
+
+        return precond
+
+    preconditioned = jax.tree_util.tree_map(precondition, grads, s, u)
+    # preconditioned = grads
+
+    # def cosine(x, y):
+    #     x, y = jnp.reshape(x, -1), jnp.reshape(y, -1)
+    #     return x @ y / jnp.sqrt((x @ x) * (y @ y))
+    # jax.debug.print("cosine: {}", jax.tree_map(cosine, preconditioned, grads))
+
+    # TODO: implement automatic learning rate
+    updates, new_opt_state = gradient_transform.update(preconditioned, opt_state, params_compute,
                                                        inputs=inputs, targets=targets, loss_fn=loss_fn,
                                                        loss_scale=loss_scale, policy=policy)
     new_params = optax.apply_updates(params, updates)
@@ -247,7 +341,11 @@ def train(params,
     opt_state = gradient_transform.init(params)
 
     key = jax.random.PRNGKey(42)
-    sketchy_state = create_sketchy_state(key, params, rank=sketchy_rank, rho=0.01, update_freq=1, precond_dtype=policy.compute_dtype)
+    # The computation of (eigenvalues, eigenvectors) = (s, u) does not
+    # include accumulation (e.g. moving average), so they cannot benefit
+    # from being stored in high precision. As a result, we store them
+    # as policy.compute_dtype.
+    sketchy_state = create_sketchy_state(key, params, rank=sketchy_rank, rho=0.01, update_freq=2, precond_dtype=policy.compute_dtype)
 
     if policy.compute_dtype is jnp.float32:
         loss_scale = jmp.NoOpLossScale()
@@ -285,10 +383,10 @@ def main(model_size: str = "124M",
          models_dir: str = "models",
          data_dir: str = "data/openwebtext",
          finetune: bool = True,
-         lora_rank: Optional[int] = None,
-         sketchy_rank: int = 1,
-         gradient_accumulation: int = 5 * 8,
-         batch_size: int = 6,
+         lora_rank: Optional[int] = 1,
+         sketchy_rank: int = 5,
+         gradient_accumulation: int = 2,
+         batch_size: int = 1,
          learning_rate: float = 6e-4,
          max_iter: int = 600000,
          weight_decay: float = 1e-1,
