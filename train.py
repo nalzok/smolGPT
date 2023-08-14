@@ -229,40 +229,51 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
     # Nystrom approximation
     def estimate_hessian(hvp, omg):
         # TODO: instead of reshaping weight matrices into vectors, can we precondition each row/column separately?
-        r, *shape = hvp.shape
+        rank, *shape = hvp.shape
         p = np.prod(shape, dtype=int)
-        hvp = jnp.reshape(hvp, (r, p))
-        omg = jnp.reshape(omg, (r, p))
+        hvp = jnp.reshape(hvp, (rank, p))
+        omg = jnp.reshape(omg, (rank, p))
 
-        def cond_fun(reg):
-            hvp_reg = hvp + reg * omg
-            quad = (omg @ hvp_reg.T).astype(jnp.float32)    # jnp.linalg.{cholesky,svd} does not support bfloat16
-            l = jnp.linalg.cholesky(quad)
-            return jnp.any(jnp.isnan(l))
+        def svd(b):
+            # use host callback when CUDA runs out of memory for large p
+            #
+            u, sigma, _ = jnp.linalg.svd(b, full_matrices=False)
 
-        def body_fun(reg):
-            return 2 * reg
+            # result_shape = (jax.ShapeDtypeStruct((p, rank), b.dtype),
+            #                 jax.ShapeDtypeStruct((rank,), b.dtype),
+            #                 jax.ShapeDtypeStruct((rank, rank), b.dtype))
+            # u, sigma, _ = jax.pure_callback(partial(np.linalg.svd, full_matrices=False), result_shape, b)
 
-        regularizer = jax.lax.while_loop(cond_fun, body_fun, jnp.finfo(hvp.dtype).eps)
+            return u, sigma
+
+        regularizer = jnp.linalg.norm(hvp) * jnp.finfo(hvp.dtype).eps
         hvp = hvp + regularizer * omg
-        quad = (omg @ hvp.T).astype(jnp.float32)    # jnp.linalg.{cholesky,svd} does not support bfloat16
+
+        quad = (omg @ hvp.T).astype(jnp.float32)    # jnp.linalg.{svd,eigh} does not support bfloat16
+        quad = (quad + quad.T) / 2                  # numerical stability
         l = jnp.linalg.cholesky(quad)
-        b = jax.scipy.linalg.solve_triangular(l, hvp, lower=True).T
+        is_convex = jnp.logical_not(jnp.any(jnp.isnan(l)))
 
-        # use host callback when CUDA runs out of memory for large p
-        #
-        u, sigma, _ = jnp.linalg.svd(b, full_matrices=False)
+        def convex_case():
+            b = jax.scipy.linalg.solve_triangular(l, hvp, lower=True).T
+            u, sigma = svd(b)
+            s = jnp.maximum(0, sigma**2 - regularizer).T
+            return s, u
 
-        # result_shape = (jax.ShapeDtypeStruct((p, r), b.dtype),
-        #                 jax.ShapeDtypeStruct((r,), b.dtype),
-        #                 jax.ShapeDtypeStruct((r, r), b.dtype))
-        # u, sigma, _ = jax.pure_callback(partial(np.linalg.svd, full_matrices=False), result_shape, b)
+        def nonconvex_case():
+            gamma, w = jnp.linalg.eigh(quad)
+            lambda_min = jnp.min(w)
+            r = w * (gamma - lambda_min)**(-0.5) @ w.T
+            b = hvp.T @ r
+            u, sigma = svd(b)
+            s = jnp.maximum(0, sigma**2 - regularizer + lambda_min).T
+            return s, u
 
+        s, u = jax.lax.cond(is_convex, convex_case, nonconvex_case)
+
+        s = s.astype(hvp.dtype)
         u = u.astype(hvp.dtype)
-        sigma = sigma.astype(hvp.dtype)
-
-        s = jnp.maximum(0, sigma**2 - regularizer).T
-        u = jnp.reshape(u.T, (r, *shape))
+        u = jnp.reshape(u.T, (rank, *shape))
 
         return s, u
 
@@ -419,9 +430,9 @@ def main(model_size: str = "124M",
          data_dir: str = "data/openwebtext",
          finetune: bool = True,
          lora_rank: Optional[int] = 1,
-         sketchy_rank: int = 5,
-         gradient_accumulation: int = 1,
-         batch_size: int = 1,
+         sketchy_rank: int = 16,
+         gradient_accumulation: int = 1024,
+         batch_size: int = 2,
          learning_rate: float = 6e-4,
          max_iter: int = 600000,
          weight_decay: float = 1e-1,
