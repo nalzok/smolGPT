@@ -54,7 +54,7 @@ google-auth-oauthlib==1.0.0
     # via tensorboard
 google-pasta==0.2.0
     # via tensorflow-cpu
-grpcio==1.56.2
+grpcio==1.57.0
     # via
     #   tensorboard
     #   tensorflow-cpu
@@ -109,9 +109,11 @@ nvidia-cuda-cupti-cu12==12.2.131
     # via jax
 nvidia-cuda-nvcc-cu12==12.2.128
     # via jax
+nvidia-cuda-nvrtc-cu12==12.2.128
+    # via nvidia-cudnn-cu12
 nvidia-cuda-runtime-cu12==12.2.128
     # via jax
-nvidia-cudnn-cu12==8.9.2.26
+nvidia-cudnn-cu12==8.9.4.25
     # via jax
 nvidia-cufft-cu12==11.0.8.91
     # via jax
@@ -141,7 +143,7 @@ packaging==23.1
     # via tensorflow-cpu
 pathtools==0.1.2
     # via wandb
-protobuf==4.23.4
+protobuf==4.24.0
     # via
     #   tensorboard
     #   tensorflow-cpu
@@ -158,7 +160,7 @@ pyasn1-modules==0.3.0
     # via google-auth
 pyyaml==6.0.1
     # via wandb
-regex==2023.6.3
+regex==2023.8.8
     # via -r requirements.in
 requests==2.31.0
     # via
@@ -205,7 +207,7 @@ termcolor==2.3.0
     #   tensorflow-cpu
 toolz==0.12.0
     # via chex
-tqdm==4.65.0
+tqdm==4.66.1
     # via -r requirements.in
 typing-extensions==4.5.0
     # via
