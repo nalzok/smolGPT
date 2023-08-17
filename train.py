@@ -50,12 +50,21 @@ class DataLoader:
         return x, y
 
 
+def path_to_key(path, data = None):
+    path_bytes = "".join(str(p) for p in path).encode()
+    path_hash = int(sha1(path_bytes).hexdigest(), 16) % maxsize
+    key = jax.random.PRNGKey(path_hash)
+
+    if data is not None:
+        key = jax.random.fold_in(key, data)
+
+    return key
+
+
 def randomize_params(params, n_layer):
     # see https://github.com/karpathy/nanoGPT/blob/4eb7a96b077998f28b57938c2f1e511b0d8cab7c/model.py#L140-L145
     def randomize(path, leaf):
-        path_bytes = "".join(str(p) for p in path).encode()
-        path_hash = int(sha1(path_bytes).hexdigest(), 16) % maxsize
-        key_leaf = jax.random.PRNGKey(path_hash)
+        key_leaf = path_to_key(path)
 
         if path[-1].key == "b":                 # bias
             return jnp.zeros_like(leaf)
@@ -97,9 +106,7 @@ def init_lora(params, lora_rank):
         if isinstance(leaf, np.ndarray) or isinstance(leaf, jax.Array):
             return None
 
-        path_bytes = "".join(str(p) for p in path).encode()
-        path_hash = int(sha1(path_bytes).hexdigest(), 16) % maxsize
-        key_leaf = jax.random.PRNGKey(path_hash)
+        key_leaf = path_to_key(path)
 
         null = {k: None for k in leaf}
         if path[-1].key in {"c_attn", "c_proj"} and path[-2].key == "attn":
@@ -129,17 +136,21 @@ def create_sketchy_state(key, params, rank, rho, update_freq, precond_dtype):
     # eigenvalues
     s = jax.tree_util.tree_map(lambda x: jnp.zeros(rank, dtype=precond_dtype or x.dtype), params)
 
-    def random_orthogonal(x):
+    def random_orthogonal(path, x):
         # NOTE: use jax.flatten_util.ravel_pytree if we want to precondition jointly
+        path_bytes = "".join(str(p) for p in path).encode()
+        path_hash = int(sha1(path_bytes).hexdigest(), 16) % maxsize
+        key_leaf = jax.random.fold_in(key, path_hash)
+
         p = np.prod(x.shape, dtype=int)
-        rand = jax.random.normal(key, (p, rank), dtype=jnp.float32)
+        rand = jax.random.normal(key_leaf, (p, rank), dtype=jnp.float32)
         q, _ = jnp.linalg.qr(rand)  # jnp.linalg.qr does not support bfloat16
         q = q.astype(precond_dtype or x.dtype)
         q = jnp.reshape(q.T, (rank, *x.shape))
         return q
 
     # eigenvectors
-    u = jax.tree_util.tree_map(random_orthogonal, params)
+    u = jax.tree_util.tree_map_with_path(random_orthogonal, params)
 
     rho = jnp.array(rho, precond_dtype)
     update_freq = jnp.array(update_freq, jnp.int32)
@@ -179,21 +190,26 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
         new_hvps = jax.tree_map(welford_update, hvps, curr_hvps)
         return (new_grads, new_hvps), loss
 
-    def random_orthogonal(x):
+    def random_normal(path, x):
         # NOTE: use jax.flatten_util.ravel_pytree if we want to precondition jointly
-        _, _, _, schedule_state, _ = opt_state
-        key = jax.random.PRNGKey(schedule_state.count)
+        key_leaf = path_to_key(path, data=sketchy_state.count)
+        rand = jax.random.normal(key_leaf, x.shape, x.dtype)
+        return rand
+
+    def random_orthogonal(path, x):
+        rand = random_normal(path, x)
+
         r, *shape = x.shape
         p = np.prod(shape, dtype=int)
-        rand = jax.random.normal(key, (p, r), dtype=jnp.float32)
-        q, _ = jnp.linalg.qr(rand)  # jnp.linalg.qr does not support bfloat16
+        rand = jnp.reshape(rand, (p, r)).astype(jnp.float32)    # jnp.linalg.qr does not support bfloat16
+        q, _ = jnp.linalg.qr(rand)
         q = q.astype(x.dtype)
-        q = jnp.reshape(q.T, (r, *shape))
+        q = jnp.reshape(q.T, (r, *shape))   # represent rank with the leading axis to make vectorization easier
         return q
 
     omega = jax.lax.cond(
         sketchy_state.count % sketchy_state.update_freq == 0,
-        lambda: jax.tree_util.tree_map(random_orthogonal, sketchy_state.u),
+        lambda: jax.tree_util.tree_map_with_path(random_orthogonal, sketchy_state.u),
         lambda: jax.tree_util.tree_map(jnp.zeros_like, sketchy_state.u)
     )
 
@@ -266,7 +282,7 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
             r = w * (gamma - lambda_min)**(-0.5) @ w.T
             b = hvp.T @ r
             u, sigma = svd(b)
-            s = jnp.maximum(0, sigma**2 - regularizer + lambda_min).T
+            s = (sigma**2 - regularizer + lambda_min).T
             return s, u
 
         s, u = jax.lax.cond(is_convex, convex_case, nonconvex_case)
@@ -323,6 +339,62 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
     dist_cos = jnp.dot(x, y) / jnp.linalg.norm(x) / jnp.linalg.norm(y)
     dist_euc = jnp.linalg.norm(x - y)
 
+    # spectral norm of the difference between consecutive Hessian estimations
+    def project(v, new_u, new_s, old_u, old_s):
+        r, *shape = new_u.shape
+        p = np.prod(shape, dtype=int)
+        v = jnp.reshape(v, (p,))
+        new_u = jnp.reshape(new_u, (r, p))
+        old_u = jnp.reshape(old_u, (r, p))
+
+        projection = new_u.T * new_s @ (new_u @ v) - old_u.T * old_s @ (old_u @ v)
+        projection = jnp.reshape(projection, shape)
+        return projection
+
+    def should_continue(val):
+        # https://scicomp.stackexchange.com/questions/592
+        _, _, r_norm, iter = val
+
+        cond = jnp.logical_and(
+            jnp.logical_not(jnp.isnan(r_norm)),
+            jnp.logical_and(r_norm > 1e-6, iter < 64)
+        )
+
+        return cond
+
+    def power_iteration(val):
+        _, eigenvector, _, iter = val
+
+        projection = jax.tree_map(project,
+                                  eigenvector,
+                                  new_sketchy_state.u,
+                                  new_sketchy_state.s,
+                                  sketchy_state.u,
+                                  sketchy_state.s)
+
+        def eigenvalue_fn(p, d):
+            p, _ = jax.flatten_util.ravel_pytree(p)
+            d, _ = jax.flatten_util.ravel_pytree(d)
+            eigenvalue = jnp.sign(jnp.dot(p, d)) * jnp.linalg.norm(p)
+            return eigenvalue
+
+        eigenvalue = jax.tree_map(eigenvalue_fn, projection, eigenvector)
+        eigenvector = jax.tree_map(lambda x, n: x/n, projection, eigenvalue)
+
+        residual = jax.tree_map(lambda p, e, v: jnp.linalg.norm(p - e * v),
+                                projection,
+                                eigenvalue,
+                                eigenvector)
+        r_norm = optax.global_norm(residual)
+
+        return eigenvalue, eigenvector, r_norm, iter + 1
+
+    eigenvalue = jax.tree_map(lambda _: 0., grads)
+    eigenvector = jax.tree_util.tree_map_with_path(random_normal, grads)
+    init_val = eigenvalue, eigenvector, jnp.inf, 0
+    eigenvalue, _, _, _ = jax.lax.while_loop(should_continue, power_iteration, init_val)
+    dist_spectral = optax.global_norm(eigenvalue)
+
     # TODO: implement automatic learning rate
     updates, new_opt_state = gradient_transform.update(preconditioned, opt_state, params_compute,
                                                        inputs=inputs, targets=targets, loss_fn=loss_fn,
@@ -338,7 +410,7 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
         (params, opt_state, sketchy_state))
 
     return new_params, new_opt_state, new_sketchy_state, new_loss_scale, loss, \
-            grads_norm, hvps_norm, s_max_norm, s_min_norm, u_norm, precond_norm, dist_cos, dist_euc
+            grads_norm, hvps_norm, s_max_norm, s_min_norm, u_norm, precond_norm, dist_cos, dist_euc, dist_spectral
 
 
 def train(params,
@@ -363,6 +435,8 @@ def train(params,
             warmup_steps=warmup_iters,
             decay_steps=lr_decay_iters,
             end_value=min_lr)
+
+    # FIXME: may gradient clipping render SketchySGD ineffective?
     mask = jax.tree_map(lambda x: x.ndim >= 2, params)
     gradient_transform = optax.chain(
             optax.clip_by_global_norm(grad_clip),
@@ -390,10 +464,9 @@ def train(params,
 
     for (inputs, targets), _ in (pbar := tqdm(dataloader, "Training")):
         params, opt_state, sketchy_state, loss_scale, loss, grads_norm, hvps_norm, \
-                s_max_norm, s_min_norm, u_norm, precond_norm, dist_cos, dist_euc \
+                s_max_norm, s_min_norm, u_norm, precond_norm, dist_cos, dist_euc, dist_spectral \
                 = train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, targets, n_head, gradient_transform, policy)
-        _, _, _, schedule_state, _ = opt_state
-        step = int(unreplicate(schedule_state.count))
+        step = int(unreplicate(sketchy_state.count))
         lr = float(scheduler(step))
         scale = int(unreplicate(loss_scale).loss_scale).bit_length() - 1
         loss = float(jnp.mean(loss))
@@ -405,9 +478,9 @@ def train(params,
         precond_norm = float(unreplicate(precond_norm))
         dist_cos = float(unreplicate(dist_cos))
         dist_euc = float(unreplicate(dist_euc))
+        dist_spectral = float(unreplicate(dist_spectral))
 
-        pbar.set_description(f"{loss = :.3}, {grads_norm = :.3}, {precond_norm = :.3}, "
-                             f"{s_max_norm = :.3}, {s_min_norm = :.3}, {dist_cos = :.3}")
+        pbar.set_description(f"{loss = :.3}, {s_max_norm = :.3}, {s_min_norm = :.3}, {dist_cos = :.3}, {dist_spectral = :.3}")
         wandb.log({
             "lr": lr,
             "scale": scale,
@@ -420,6 +493,7 @@ def train(params,
             "precond_norm": precond_norm,
             "dist_cos": dist_cos,
             "dist_euc": dist_euc,
+            "dist_spectral": dist_spectral,
         }, step)
 
     return unreplicate(params)
