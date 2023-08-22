@@ -260,29 +260,33 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
             #                 jax.ShapeDtypeStruct((rank, rank), b.dtype))
             # u, sigma, _ = jax.pure_callback(partial(np.linalg.svd, full_matrices=False), result_shape, b)
 
-            return u, sigma
+            return sigma, u
 
         regularizer = jnp.linalg.norm(hvp) * jnp.finfo(hvp.dtype).eps
         hvp = hvp + regularizer * omg
 
         quad = (omg @ hvp.T).astype(jnp.float32)    # jnp.linalg.{svd,eigh} does not support bfloat16
-        quad = (quad + quad.T) / 2                  # numerical stability
+        quad = (quad + quad.T) / 2                  # symmetrization
         l = jnp.linalg.cholesky(quad)
         is_convex = jnp.logical_not(jnp.any(jnp.isnan(l)))
 
         def convex_case():
             b = jax.scipy.linalg.solve_triangular(l, hvp, lower=True).T
-            u, sigma = svd(b)
+            sigma, u = svd(b)
             s = jnp.maximum(0, sigma**2 - regularizer).T
             return s, u
 
         def nonconvex_case():
             gamma, w = jnp.linalg.eigh(quad)
-            lambda_min = jnp.min(w)
-            r = w * (gamma - lambda_min)**(-0.5) @ w.T
+            shift = -jnp.min(gamma)
+            gamma_sft = gamma + shift
+            gamma_neg_sqrt = jnp.where(gamma_sft == 0,
+                                       gamma_sft,   # Moore-Penrose pseudoinverse
+                                       gamma_sft**(-0.5))
+            r = w * gamma_neg_sqrt @ w.T
             b = hvp.T @ r
-            u, sigma = svd(b)
-            s = (sigma**2 - regularizer + lambda_min).T
+            sigma, u = svd(b)
+            s = jnp.abs(sigma**2 - regularizer - shift).T
             return s, u
 
         s, u = jax.lax.cond(is_convex, convex_case, nonconvex_case)
