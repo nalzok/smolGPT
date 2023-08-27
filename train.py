@@ -501,7 +501,8 @@ def train(params,
         dist_euc = float(unreplicate(dist_euc))
         dist_spectral = float(unreplicate(dist_spectral))
 
-        if step % eval_freq == 0:
+        # step starts from 1
+        if (step - 1) % eval_freq == 0:
             va.reset()
             va_inputs, va_targets = next(va)
             va_loss = valid_step(params, frozen, va_inputs, va_targets, n_head)
@@ -533,7 +534,7 @@ def main(model_size: str = "124M",
          data_dir: str = "data/openwebtext",
          finetune: bool = True,
          lora_rank: Optional[int] = 1,
-         sketchy_rank: int = 2,
+         sketchy_rank: int = 32,
          gradient_accumulation: int = 512,
          batch_size: int = 2,
          learning_rate: float = 6e-4,
