@@ -25,7 +25,7 @@ def attention(q, k, v, mask):
 
 
 def mha(x, c_attn, c_proj, n_head):
-    B, T, C = x.shape
+    *leading, B, T, C = x.shape
     x = linear(x, **c_attn)
     q, k, v = jnp.split(x, 3, axis=-1)
     q = q.reshape(B, T, n_head, C // n_head).swapaxes(-3, -2)
@@ -33,7 +33,7 @@ def mha(x, c_attn, c_proj, n_head):
     v = v.reshape(B, T, n_head, C // n_head).swapaxes(-3, -2)
     causal_mask = (1 - jnp.tri(T, dtype=x.dtype)) * jnp.finfo(x.dtype).min
     out_heads = attention(q, k, v, causal_mask)
-    x = out_heads.swapaxes(-3, -2).reshape(B, T, C)
+    x = out_heads.swapaxes(-3, -2).reshape(*leading, B, T, C)
     x = linear(x, **c_proj)
     return x
 

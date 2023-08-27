@@ -27,7 +27,7 @@ from smolGPT.utils import (
 
 
 class DataLoader:
-    def __init__(self, filename, context_length, gradient_accumulation, batch_size) -> None:
+    def __init__(self, filename, context_length, gradient_accumulation, batch_size, seed = 42) -> None:
         self.data = np.memmap(filename, dtype=np.uint16, mode="r")
         self.context_length = context_length
         device_count = jax.local_device_count()
@@ -35,7 +35,8 @@ class DataLoader:
             raise ValueError(f"{gradient_accumulation % device_count = }")
         self.index_shape = (device_count, gradient_accumulation // device_count, batch_size)
         self.shape = (device_count, gradient_accumulation // device_count, batch_size, self.context_length)
-        self.rng = np.random.default_rng(42)
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
 
     def __iter__(self):
         return self
@@ -48,6 +49,9 @@ class DataLoader:
             x[ij] = self.data[index:index+self.context_length]
             y[ij] = self.data[index+1:index+1+self.context_length]
         return x, y
+
+    def reset(self):
+        self.rng = np.random.default_rng(self.seed)
 
 
 def path_to_key(path, data = None):
@@ -330,12 +334,7 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
         precond = jnp.reshape(precond, shape)
         return precond
 
-    import os
-    if int(os.environ["PRECONDITION"]):
-        preconditioned = jax.tree_util.tree_map(precondition, grads, s, u)
-    else:
-        preconditioned = grads
-
+    preconditioned = jax.tree_util.tree_map(precondition, grads, s, u)
     precond_norm = optax.global_norm(preconditioned)
 
     x, _ = jax.flatten_util.ravel_pytree(preconditioned)
@@ -417,6 +416,16 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
             grads_norm, hvps_norm, s_max_norm, s_min_norm, u_norm, precond_norm, dist_cos, dist_euc, dist_spectral
 
 
+@partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(4,))
+def valid_step(params, frozen, va_inputs, va_targets, n_head):
+    merged = jax.tree_map(lambda a, b: a if a is not None else b,
+                          frozen, params, is_leaf=lambda x: x is None)
+    logits = gpt2(va_inputs, **merged, n_head=n_head)
+    losses = optax.softmax_cross_entropy_with_integer_labels(logits, va_targets)
+    loss = jnp.mean(losses)
+    return loss
+
+
 def train(params,
           frozen,
           tr,
@@ -432,7 +441,9 @@ def train(params,
           warmup_iters,
           lr_decay_iters,
           min_lr,
-          policy):
+          policy,
+          eval_freq,
+          eval_iter):
     scheduler = optax.warmup_cosine_decay_schedule(
             init_value=0,
             peak_value=learning_rate,
@@ -444,7 +455,7 @@ def train(params,
     mask = jax.tree_map(lambda x: x.ndim >= 2, params)
     gradient_transform = optax.chain(
             optax.clip_by_global_norm(grad_clip),
-            optax.scale_by_adam(beta1, beta2),
+            # optax.scale_by_adam(beta1, beta2),
             optax.add_decayed_weights(weight_decay, mask),
             optax.scale_by_schedule(scheduler),
             optax.scale(-1.0),
@@ -456,7 +467,7 @@ def train(params,
     # include accumulation (e.g. moving average), so they cannot benefit
     # from being stored in high precision. As a result, we store them
     # as policy.compute_dtype.
-    sketchy_state = create_sketchy_state(key, params, rank=sketchy_rank, rho=0.01, update_freq=32, precond_dtype=policy.compute_dtype)
+    sketchy_state = create_sketchy_state(key, params, rank=sketchy_rank, rho=0.1, update_freq=1024, precond_dtype=policy.compute_dtype)
 
     if policy.compute_dtype is jnp.float32:
         loss_scale = jmp.NoOpLossScale()
@@ -464,9 +475,10 @@ def train(params,
         loss_scale = jmp.DynamicLossScale(jnp.array(2**16, dtype=policy.param_dtype))
 
     params, frozen, opt_state, sketchy_state, loss_scale = replicate((params, frozen, opt_state, sketchy_state, loss_scale))
-    dataloader = islice(zip(tr, va), max_iter)
+    tr_loader = islice(tr, max_iter)
+    va_loss = jnp.nan
 
-    for (inputs, targets), _ in (pbar := tqdm(dataloader, "Training")):
+    for inputs, targets in (pbar := tqdm(tr_loader, "Training")):
         params, opt_state, sketchy_state, loss_scale, loss, grads_norm, hvps_norm, \
                 s_max_norm, s_min_norm, u_norm, precond_norm, dist_cos, dist_euc, dist_spectral \
                 = train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, targets, n_head, gradient_transform, policy)
@@ -484,11 +496,23 @@ def train(params,
         dist_euc = float(unreplicate(dist_euc))
         dist_spectral = float(unreplicate(dist_spectral))
 
-        pbar.set_description(f"{loss = :.3}, {s_max_norm = :.3}, {s_min_norm = :.3}, {dist_cos = :.3}, {dist_spectral = :.3}")
+        if step % eval_freq == 0:
+            va.reset()
+            va_loader = islice(va, eval_iter)
+            va_loss_total = 0
+            for va_inputs, va_targets in (subpbar := tqdm(va_loader, "Evaluating", leave=False)):
+                va_loss_batch = valid_step(params, frozen, va_inputs, va_targets, n_head)
+                va_loss_batch = float(jnp.mean(va_loss_batch))
+                va_loss_total += va_loss_batch
+                subpbar.set_description(f"{va_loss_batch = :.3}")
+            va_loss = va_loss_total / eval_iter
+
+        pbar.set_description(f"{loss = :.3}, {va_loss = :.3}, {s_max_norm = :.3}, {dist_cos = :.3}, {dist_spectral =:.3}")
         wandb.log({
             "lr": lr,
             "scale": scale,
             "loss": loss,
+            "va_loss": va_loss,
             "grads_norm": grads_norm,
             "hvps_norm": hvps_norm,
             "s_max_norm": s_max_norm,
@@ -508,7 +532,7 @@ def main(model_size: str = "124M",
          data_dir: str = "data/openwebtext",
          finetune: bool = True,
          lora_rank: Optional[int] = 1,
-         sketchy_rank: int = 16,
+         sketchy_rank: int = 2,
          gradient_accumulation: int = 1024,
          batch_size: int = 2,
          learning_rate: float = 6e-4,
@@ -520,7 +544,9 @@ def main(model_size: str = "124M",
          warmup_iters: int = 2000,
          lr_decay_iters: int = 600000,
          min_lr: float = 6e-5,
-         jmp_policy: str = "params=float32,compute=bfloat16,output=float32"):
+         jmp_policy: str = "params=float32,compute=bfloat16,output=float32",
+         eval_freq: int = 256,
+         eval_iter: int = 4):
 
     if not finetune and lora_rank is not None:
         raise ValueError("You cannot train a LoRA model from scratch")
@@ -563,7 +589,9 @@ def main(model_size: str = "124M",
                    warmup_iters,
                    lr_decay_iters,
                    min_lr,
-                   policy)
+                   policy,
+                   eval_freq,
+                   eval_iter)
     wandb.finish()
 
 

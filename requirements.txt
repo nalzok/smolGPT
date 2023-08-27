@@ -30,7 +30,7 @@ chex==0.1.7
     # via
     #   -r requirements.in
     #   optax
-click==8.1.6
+click==8.1.7
     # via wandb
 dm-tree==0.1.8
     # via chex
@@ -123,7 +123,7 @@ nvidia-cusparse-cu11==11.7.5.86
     # via jax
 nvidia-ml-py==12.535.77
     # via nvitop
-nvitop==1.2.0
+nvitop==1.3.0
     # via -r requirements.in
 oauthlib==3.2.2
     # via requests-oauthlib
@@ -137,7 +137,7 @@ packaging==23.1
     # via tensorflow-cpu
 pathtools==0.1.2
     # via wandb
-protobuf==4.24.0
+protobuf==4.24.2
     # via
     #   tensorboard
     #   tensorflow-cpu
@@ -166,7 +166,7 @@ requests-oauthlib==1.3.1
     # via google-auth-oauthlib
 rsa==4.9
     # via google-auth
-scipy==1.11.1
+scipy==1.11.2
     # via
     #   jax
     #   jaxlib
@@ -216,7 +216,7 @@ wandb==0.15.8
     # via -r requirements.in
 werkzeug==2.3.7
     # via tensorboard
-wheel==0.41.1
+wheel==0.41.2
     # via
     #   astunparse
     #   tensorboard
