@@ -418,10 +418,16 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
 
 @partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(4,))
 def valid_step(params, frozen, va_inputs, va_targets, n_head):
-    merged = jax.tree_map(lambda a, b: a if a is not None else b,
-                          frozen, params, is_leaf=lambda x: x is None)
-    logits = gpt2(va_inputs, **merged, n_head=n_head)
-    losses = optax.softmax_cross_entropy_with_integer_labels(logits, va_targets)
+    def loss_fn(args):
+        va_input, va_target = args
+        merged = jax.tree_map(lambda a, b: a if a is not None else b,
+                              frozen, params, is_leaf=lambda x: x is None)
+        logits = gpt2(va_input, **merged, n_head=n_head)
+        losses = optax.softmax_cross_entropy_with_integer_labels(logits, va_target)
+        loss = jnp.mean(losses)
+        return loss
+
+    losses = jax.lax.map(loss_fn, (va_inputs, va_targets))
     loss = jnp.mean(losses)
     return loss
 
@@ -442,8 +448,7 @@ def train(params,
           lr_decay_iters,
           min_lr,
           policy,
-          eval_freq,
-          eval_iter):
+          eval_freq):
     scheduler = optax.warmup_cosine_decay_schedule(
             init_value=0,
             peak_value=learning_rate,
@@ -498,17 +503,13 @@ def train(params,
 
         if step % eval_freq == 0:
             va.reset()
-            va_loader = islice(va, eval_iter)
-            va_loss_total = 0
-            for va_inputs, va_targets in (subpbar := tqdm(va_loader, "Evaluating", leave=False)):
-                va_loss_batch = valid_step(params, frozen, va_inputs, va_targets, n_head)
-                va_loss_batch = float(jnp.mean(va_loss_batch))
-                va_loss_total += va_loss_batch
-                subpbar.set_description(f"{va_loss_batch = :.3}")
-            va_loss = va_loss_total / eval_iter
+            va_inputs, va_targets = next(va)
+            va_loss = valid_step(params, frozen, va_inputs, va_targets, n_head)
+            va_loss = float(jnp.mean(va_loss))
 
-        pbar.set_description(f"{loss = :.3}, {va_loss = :.3}, {s_max_norm = :.3}, {dist_cos = :.3}, {dist_spectral =:.3}")
+        pbar.set_description(f"{loss = :.3}, {va_loss = :.3}, {s_max_norm = :.3}, {dist_cos = :.3}, {dist_spectral = :.3}")
         wandb.log({
+            "step": step,
             "lr": lr,
             "scale": scale,
             "loss": loss,
@@ -545,8 +546,9 @@ def main(model_size: str = "124M",
          lr_decay_iters: int = 600000,
          min_lr: float = 6e-5,
          jmp_policy: str = "params=float32,compute=bfloat16,output=float32",
-         eval_freq: int = 256,
-         eval_iter: int = 4):
+         eval_freq: int = 1,
+         eval_accumulation: int = 128,
+         eval_batch_size: int = 16):
 
     if not finetune and lora_rank is not None:
         raise ValueError("You cannot train a LoRA model from scratch")
@@ -559,7 +561,7 @@ def main(model_size: str = "124M",
 
     data_path = Path(data_dir)
     tr = DataLoader(data_path/"train.bin", context_length, gradient_accumulation, batch_size)
-    va = DataLoader(data_path/"val.bin", context_length, gradient_accumulation, batch_size)
+    va = DataLoader(data_path/"val.bin", context_length, eval_accumulation, eval_batch_size)
 
     policy = jmp.get_policy(jmp_policy)
     params = policy.cast_to_param(params)
@@ -590,8 +592,7 @@ def main(model_size: str = "124M",
                    lr_decay_iters,
                    min_lr,
                    policy,
-                   eval_freq,
-                   eval_iter)
+                   eval_freq)
     wandb.finish()
 
 
