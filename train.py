@@ -22,7 +22,6 @@ from smolGPT.utils import (
     unreplicate,
     is_penultimate,
     canonicalize_dtype,
-    safe_int32_increment
 )
 
 
@@ -128,13 +127,11 @@ def init_lora(params, lora_rank):
 class SketchySGDState(NamedTuple):
     """State for the SketchySGD algorithm."""
     rho: jax.Array
-    update_freq: jax.Array
-    count: jax.Array
     s: jax.Array
     u: jax.Array
 
 
-def create_sketchy_state(key, params, rank, rho, update_freq, precond_dtype):
+def create_sketchy_state(key, params, rank, rho, precond_dtype):
     precond_dtype = canonicalize_dtype(precond_dtype)
 
     # eigenvalues
@@ -157,14 +154,12 @@ def create_sketchy_state(key, params, rank, rho, update_freq, precond_dtype):
     u = jax.tree_util.tree_map_with_path(random_orthogonal, params)
 
     rho = jnp.array(rho, precond_dtype)
-    update_freq = jnp.array(update_freq, jnp.int32)
-    count = jnp.zeros([], jnp.int32)
-    sketchy_state = SketchySGDState(rho, update_freq, count, s, u)
+    sketchy_state = SketchySGDState(rho, s, u)
     return sketchy_state
 
 
-@partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(7, 8, 9), donate_argnums=(0, 1, 2, 3))
-def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, targets, n_head, gradient_transform, policy):
+@partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(7, 8), donate_argnums=(0, 1))
+def estimate_step(sketchy_state, loss_scale, params, frozen, es_inputs, es_targets, seed, n_head, policy):
 
     def loss_fn(p, input_, target):
         merged = jax.tree_map(lambda a, b: a if a is not None else b,
@@ -173,14 +168,6 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
         losses = optax.softmax_cross_entropy_with_integer_labels(logits, target)
         loss = jnp.mean(losses)
         return loss_scale.scale(loss), loss
-
-    def avg_grads(grads_hvps, x):
-        grads, hvps = grads_hvps
-        input_, target, mini_step = x
-        curr_grads, loss = jax.grad(loss_fn, has_aux=True)(params_compute, input_, target)
-        welford_update = lambda acc, new: acc + (new - acc) / (mini_step + 1)
-        new_grads = jax.tree_map(welford_update, grads, curr_grads)
-        return (new_grads, hvps), loss
 
     def avg_grads_hvps(grads_hvps, x):
         grads, hvps = grads_hvps
@@ -196,7 +183,7 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
 
     def random_normal(path, x):
         # NOTE: use jax.flatten_util.ravel_pytree if we want to precondition jointly
-        key_leaf = path_to_key(path, data=sketchy_state.count)
+        key_leaf = path_to_key(path, data=seed)
         rand = jax.random.normal(key_leaf, x.shape, x.dtype)
         return rand
 
@@ -211,28 +198,19 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
         q = jnp.reshape(q.T, (r, *shape))   # represent rank with the leading axis to make vectorization easier
         return q
 
-    omega = jax.lax.cond(
-        sketchy_state.count % sketchy_state.update_freq == 0,
-        lambda: jax.tree_util.tree_map_with_path(random_orthogonal, sketchy_state.u),
-        lambda: jax.tree_util.tree_map(jnp.zeros_like, sketchy_state.u)
-    )
+    omega = jax.tree_util.tree_map_with_path(random_orthogonal, sketchy_state.u)
 
     # alternatively, do power iteration:
     # omega = sketchy_state.u
 
-    params_compute, omega, inputs, targets = policy.cast_to_compute((params, omega, inputs, targets))
+    params_compute, omega, inputs, targets = policy.cast_to_compute((params, omega, es_inputs, es_targets))
 
     init = (jax.tree_map(jnp.zeros_like, params_compute),
             jax.tree_map(jnp.zeros_like, omega))
     xs = (inputs, targets, jnp.arange(inputs.shape[0]))
 
     # using map/scan-over-grad instead of grad-over-map/scan to reduce memory consumption
-    (grads, hvps), losses = jax.lax.cond(
-        sketchy_state.count % sketchy_state.update_freq == 0,
-        lambda i, x: jax.lax.scan(avg_grads_hvps, i, x),
-        lambda i, x: jax.lax.scan(avg_grads, i, x),
-        init,
-        xs)
+    (grads, hvps), losses = jax.lax.scan(avg_grads_hvps, init, xs)
     losses = policy.cast_to_output(losses)
     loss = jnp.mean(losses)
 
@@ -301,12 +279,7 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
 
         return s, u
 
-    # only update s and u when (count % update_freq) == 0
-    su = jax.lax.cond(
-        sketchy_state.count % sketchy_state.update_freq == 0,
-        lambda: jax.tree_map(estimate_hessian, policy.cast_to_compute(hvps), omega),
-        lambda: jax.tree_map(lambda s, u: (s, u), sketchy_state.s, sketchy_state.u),
-    )
+    su = jax.tree_map(estimate_hessian, policy.cast_to_compute(hvps), omega)
     s = jax.tree_map(lambda x: x[0], su, is_leaf=lambda x: isinstance(x, tuple))
     u = jax.tree_map(lambda x: x[1], su, is_leaf=lambda x: isinstance(x, tuple))
 
@@ -314,33 +287,7 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
     s_min_norm = optax.global_norm(jax.tree_map(lambda x: x[-1], s))
     u_norm = optax.global_norm(u)
 
-    count_inc = safe_int32_increment(sketchy_state.count)
-    new_sketchy_state = sketchy_state._replace(
-        count=count_inc, s=s, u=u,
-    )
-
-    def precondition(grad, s, u):
-        r, *shape = u.shape
-        p = np.prod(shape, dtype=int)
-        grad = jnp.reshape(grad, (p,))
-        u = jnp.reshape(u, (r, p))
-
-        # Precondition with the Woodbury formula, equivalent to
-        #   precond = jnp.linalg.solve(u.T @ jnp.diag(s) @ u + rho * jnp.eye(grad.shape[0]), grad)
-        rho = sketchy_state.rho
-        u_grad = u @ grad
-        precond = u.T / (s + rho) @ u_grad + (grad - u.T @ u_grad) / rho
-
-        precond = jnp.reshape(precond, shape)
-        return precond
-
-    preconditioned = jax.tree_util.tree_map(precondition, grads, s, u)
-    precond_norm = optax.global_norm(preconditioned)
-
-    x, _ = jax.flatten_util.ravel_pytree(preconditioned)
-    y, _ = jax.flatten_util.ravel_pytree(grads)
-    dist_cos = jnp.dot(x, y) / jnp.linalg.norm(x) / jnp.linalg.norm(y)
-    dist_euc = jnp.linalg.norm(x - y)
+    new_sketchy_state = sketchy_state._replace(s=s, u=u)
 
     # spectral norm of the difference between consecutive Hessian estimations
     def project(v, new_u, new_s, old_u, old_s):
@@ -398,6 +345,74 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
     eigenvalue, _, _, _ = jax.lax.while_loop(should_continue, power_iteration, init_val)
     dist_spectral = optax.global_norm(eigenvalue)
 
+    # loss_scale will always be the same across devices thanks to pmean
+    grads_finite = jmp.all_finite((grads, hvps))
+    new_loss_scale = loss_scale.adjust(grads_finite)
+    new_sketchy_state = jmp.select_tree(grads_finite, new_sketchy_state, sketchy_state)
+
+    return new_sketchy_state, new_loss_scale, loss, grads_norm, hvps_norm, s_max_norm, s_min_norm, u_norm, dist_spectral
+
+
+@partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(7, 8, 9), donate_argnums=(0, 1, 2))
+def train_step(params, opt_state, loss_scale, sketchy_state, frozen, inputs, targets, n_head, gradient_transform, policy):
+
+    def loss_fn(p, input_, target):
+        merged = jax.tree_map(lambda a, b: a if a is not None else b,
+                              frozen, p, is_leaf=lambda x: x is None)
+        logits = gpt2(input_, **merged, n_head=n_head)
+        losses = optax.softmax_cross_entropy_with_integer_labels(logits, target)
+        loss = jnp.mean(losses)
+        return loss_scale.scale(loss), loss
+
+    def avg_grads(grads, x):
+        input_, target, mini_step = x
+        curr_grads, loss = jax.grad(loss_fn, has_aux=True)(params_compute, input_, target)
+        welford_update = lambda acc, new: acc + (new - acc) / (mini_step + 1)
+        new_grads = jax.tree_map(welford_update, grads, curr_grads)
+        return new_grads, loss
+
+    params_compute, inputs, targets = policy.cast_to_compute((params, inputs, targets))
+
+    init = jax.tree_map(jnp.zeros_like, params_compute)
+    xs = (inputs, targets, jnp.arange(inputs.shape[0]))
+
+    # using map/scan-over-grad instead of grad-over-map/scan to reduce memory consumption
+    grads, losses = jax.lax.scan(avg_grads, init, xs)
+    losses = policy.cast_to_output(losses)
+    loss = jnp.mean(losses)
+
+    grads = policy.cast_to_param(grads)
+    grads = jax.lax.pmean(grads, axis_name="batch")
+    grads = loss_scale.unscale(grads)
+    grads_norm = optax.global_norm(grads)
+
+    def precondition(grad, s, u):
+        r, *shape = u.shape
+        p = np.prod(shape, dtype=int)
+        grad = jnp.reshape(grad, (p,))
+        u = jnp.reshape(u, (r, p))
+
+        # Precondition with the Woodbury formula, equivalent to
+        #   precond = jnp.linalg.solve(u.T @ jnp.diag(s) @ u + rho * jnp.eye(grad.shape[0]), grad)
+        rho = sketchy_state.rho
+        u_grad = u @ grad
+        precond = u.T / (s + rho) @ u_grad + (grad - u.T @ u_grad) / rho
+
+        precond = jnp.reshape(precond, shape)
+        return precond
+
+    if sketchy_state is not None:
+        preconditioned = jax.tree_util.tree_map(precondition, grads, sketchy_state.s, sketchy_state.u)
+    else:
+        preconditioned = grads
+
+    precond_norm = optax.global_norm(preconditioned)
+
+    x, _ = jax.flatten_util.ravel_pytree(preconditioned)
+    y, _ = jax.flatten_util.ravel_pytree(grads)
+    dist_cos = jnp.dot(x, y) / jnp.linalg.norm(x) / jnp.linalg.norm(y)
+    dist_euc = jnp.linalg.norm(x - y)
+
     # TODO: implement automatic learning rate
     updates, new_opt_state = gradient_transform.update(preconditioned, opt_state, params_compute,
                                                        inputs=inputs, targets=targets, loss_fn=loss_fn,
@@ -407,13 +422,12 @@ def train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, tar
     # loss_scale will always be the same across devices thanks to pmean
     grads_finite = jmp.all_finite(grads)
     new_loss_scale = loss_scale.adjust(grads_finite)
-    new_params, new_opt_state, new_sketchy_state = jmp.select_tree(
+    new_params, new_opt_state = jmp.select_tree(
         grads_finite,
-        (new_params, new_opt_state, new_sketchy_state),
-        (params, opt_state, sketchy_state))
+        (new_params, new_opt_state),
+        (params, opt_state))
 
-    return new_params, new_opt_state, new_sketchy_state, new_loss_scale, loss, \
-            grads_norm, hvps_norm, s_max_norm, s_min_norm, u_norm, precond_norm, dist_cos, dist_euc, dist_spectral
+    return new_params, new_opt_state, new_loss_scale, loss, grads_norm, precond_norm, dist_cos, dist_euc
 
 
 @partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(4,))
@@ -435,9 +449,12 @@ def valid_step(params, frozen, va_inputs, va_targets, n_head):
 def train(params,
           frozen,
           tr,
+          es,
           va,
           n_head,
           sketchy_rank,
+          sketchy_rho,
+          sketchy_freq,
           learning_rate,
           max_iter,
           weight_decay,
@@ -472,37 +489,46 @@ def train(params,
     # include accumulation (e.g. moving average), so they cannot benefit
     # from being stored in high precision. As a result, we store them
     # as policy.compute_dtype.
-    sketchy_state = create_sketchy_state(key, params, rank=sketchy_rank, rho=0.1, update_freq=1024, precond_dtype=policy.compute_dtype)
-
-    if policy.compute_dtype is jnp.float32:
-        loss_scale = jmp.NoOpLossScale()
+    if sketchy_rank is not None:
+        sketchy_state = create_sketchy_state(key, params, rank=sketchy_rank, rho=sketchy_rho, precond_dtype=policy.compute_dtype)
     else:
+        sketchy_state = None
+
+    if policy.compute_dtype is not jnp.float32:
         loss_scale = jmp.DynamicLossScale(jnp.array(2**16, dtype=policy.param_dtype))
+    else:
+        loss_scale = jmp.NoOpLossScale()
 
     params, frozen, opt_state, sketchy_state, loss_scale = replicate((params, frozen, opt_state, sketchy_state, loss_scale))
-    tr_loader = islice(tr, max_iter)
-    va_loss = jnp.nan
+    device_count = jax.local_device_count()
+    device_ids = jnp.arange(device_count)
+    va_loss = hvps_norm = s_max_norm = s_min_norm = u_norm = dist_spectral = jnp.nan
 
-    for inputs, targets in (pbar := tqdm(tr_loader, "Training")):
-        params, opt_state, sketchy_state, loss_scale, loss, grads_norm, hvps_norm, \
-                s_max_norm, s_min_norm, u_norm, precond_norm, dist_cos, dist_euc, dist_spectral \
-                = train_step(params, opt_state, sketchy_state, loss_scale, frozen, inputs, targets, n_head, gradient_transform, policy)
-        step = int(unreplicate(sketchy_state.count))
+    tr_loader = islice(tr, max_iter)
+    for step, (inputs, targets) in enumerate(pbar := tqdm(tr_loader, "Training")):
+
+        if sketchy_state is not None and step % sketchy_freq == 0:
+            es_inputs, es_targets = next(es)
+            step_pmap = replicate(device_count * step) + device_ids
+            sketchy_state, loss_scale, loss, grads_norm, hvps_norm, s_max_norm, s_min_norm, u_norm, dist_spectral \
+                    = estimate_step(sketchy_state, loss_scale, params, frozen, es_inputs, es_targets, step_pmap, n_head, policy)
+            hvps_norm = float(unreplicate(hvps_norm))
+            s_max_norm = float(unreplicate(s_max_norm))
+            s_min_norm = float(unreplicate(s_min_norm))
+            u_norm = float(unreplicate(u_norm))
+            dist_spectral = float(unreplicate(dist_spectral))
+
+        params, opt_state, loss_scale, loss, grads_norm, precond_norm, dist_cos, dist_euc \
+                = train_step(params, opt_state, loss_scale, sketchy_state, frozen, inputs, targets, n_head, gradient_transform, policy)
         lr = float(scheduler(step))
         scale = int(unreplicate(loss_scale).loss_scale).bit_length() - 1
         loss = float(jnp.mean(loss))
         grads_norm = float(unreplicate(grads_norm))
-        hvps_norm = float(unreplicate(hvps_norm))
-        s_max_norm = float(unreplicate(s_max_norm))
-        s_min_norm = float(unreplicate(s_min_norm))
-        u_norm = float(unreplicate(u_norm))
         precond_norm = float(unreplicate(precond_norm))
         dist_cos = float(unreplicate(dist_cos))
         dist_euc = float(unreplicate(dist_euc))
-        dist_spectral = float(unreplicate(dist_spectral))
 
-        # step starts from 1
-        if (step - 1) % eval_freq == 0:
+        if step % eval_freq == 0:
             va.reset()
             va_inputs, va_targets = next(va)
             va_loss = valid_step(params, frozen, va_inputs, va_targets, n_head)
@@ -534,18 +560,22 @@ def main(model_size: str = "124M",
          data_dir: str = "data/openwebtext",
          finetune: bool = True,
          lora_rank: Optional[int] = 1,
-         sketchy_rank: int = 32,
-         gradient_accumulation: int = 512,
-         batch_size: int = 2,
          learning_rate: float = 6e-4,
+         min_lr: float = 6e-5,
+         warmup_iters: int = 2000,
+         lr_decay_iters: int = 600000,
          max_iter: int = 600000,
+         gradient_accumulation: int = 256,
+         batch_size: int = 4,
+         sketchy_rank: Optional[int] = 16,
+         sketchy_rho: float = 0.1,
+         sketchy_freq: int = 1024,
+         sketchy_accumulation: int = 512,
+         sketchy_batch_size: int = 2,
+         grad_clip: float = 1.0,
          weight_decay: float = 1e-1,
          beta1: float = 0.9,
          beta2: float = 0.95,
-         grad_clip: float = 1.0,
-         warmup_iters: int = 2000,
-         lr_decay_iters: int = 600000,
-         min_lr: float = 6e-5,
          jmp_policy: str = "params=float32,compute=bfloat16,output=float32",
          eval_freq: int = 64,
          eval_accumulation: int = 64,
@@ -562,6 +592,7 @@ def main(model_size: str = "124M",
 
     data_path = Path(data_dir)
     tr = DataLoader(data_path/"train.bin", context_length, gradient_accumulation, batch_size)
+    es = DataLoader(data_path/"train.bin", context_length, sketchy_accumulation, sketchy_batch_size)
     va = DataLoader(data_path/"val.bin", context_length, eval_accumulation, eval_batch_size)
 
     policy = jmp.get_policy(jmp_policy)
@@ -580,9 +611,12 @@ def main(model_size: str = "124M",
     params = train(params,
                    frozen,
                    tr,
+                   es,
                    va,
                    n_head,
                    sketchy_rank,
+                   sketchy_rho,
+                   sketchy_freq,
                    learning_rate,
                    max_iter,
                    weight_decay,

@@ -109,10 +109,3 @@ def canonicalize_dtype(dtype: Optional[chex.ArrayDType]) -> Optional[chex.ArrayD
     if dtype is not None:
         return jax.dtypes.canonicalize_dtype(dtype)
     return dtype
-
-
-def safe_int32_increment(count: chex.Numeric) -> chex.Numeric:
-    chex.assert_type(count, jnp.int32)
-    max_int32_value = jnp.iinfo(jnp.int32).max
-    one = jnp.array(1, dtype=jnp.int32)
-    return jnp.where(count < max_int32_value, count + one, max_int32_value)
