@@ -4,6 +4,7 @@ from functools import partial
 from itertools import islice
 from hashlib import sha1
 from sys import maxsize
+from os import environ
 
 import jax
 import jax.numpy as jnp
@@ -567,7 +568,6 @@ def main(model_size: str = "124M",
          max_iter: int = 600000,
          gradient_accumulation: int = 256,
          batch_size: int = 4,
-         sketchy_rank: Optional[int] = 16,
          sketchy_rho: float = 0.1,
          sketchy_freq: int = 1024,
          sketchy_accumulation: int = 512,
@@ -580,6 +580,11 @@ def main(model_size: str = "124M",
          eval_freq: int = 64,
          eval_accumulation: int = 64,
          eval_batch_size: int = 16):
+
+    sketchy_rank = environ.get("SKETCHY_RANK")
+    if sketchy_rank is not None:
+        # convert 0 to None
+        sketchy_rank = int(sketchy_rank) or None
 
     if not finetune and lora_rank is not None:
         raise ValueError("You cannot train a LoRA model from scratch")
