@@ -1,3 +1,5 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 
@@ -57,9 +59,13 @@ def gpt2(inputs, wte, wpe, blocks, ln_f, n_head):
 
     blocks_transposed = jax.tree_util.tree_map_with_path(collector, blocks[0])
 
-    x = wte[inputs] + wpe[:inputs.shape[-1]]
+    # https://jax.readthedocs.io/en/latest/notebooks/autodiff_remat.html#practical-notes
+    @partial(jax.checkpoint, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
     def f(x, block):
         x = transformer_block(x, **block, n_head=n_head)
         return x, None
+
+    x = wte[inputs] + wpe[:inputs.shape[-1]]
     x, _ = jax.lax.scan(f, x, blocks_transposed)
+
     return layer_norm(x, **ln_f) @ wte.T
