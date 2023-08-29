@@ -1,10 +1,9 @@
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 from pathlib import Path
 from functools import partial
 from itertools import islice
 from hashlib import sha1
 from sys import maxsize
-from os import environ
 
 import jax
 import jax.numpy as jnp
@@ -490,7 +489,7 @@ def train(params,
     # include accumulation (e.g. moving average), so they cannot benefit
     # from being stored in high precision. As a result, we store them
     # as policy.compute_dtype.
-    if sketchy_rank is not None:
+    if sketchy_rank > 0:
         sketchy_state = create_sketchy_state(key, params, rank=sketchy_rank, rho=sketchy_rho, precond_dtype=policy.compute_dtype)
     else:
         sketchy_state = None
@@ -560,7 +559,7 @@ def main(model_size: str = "124M",
          models_dir: str = "models",
          data_dir: str = "data/openwebtext",
          finetune: bool = True,
-         lora_rank: Optional[int] = 1,
+         lora_rank: int = 1,
          learning_rate: float = 6e-4,
          min_lr: float = 6e-5,
          warmup_iters: int = 2000,
@@ -568,6 +567,7 @@ def main(model_size: str = "124M",
          max_iter: int = 600000,
          gradient_accumulation: int = 256,
          batch_size: int = 4,
+         sketchy_rank: int = 4,
          sketchy_rho: float = 0.1,
          sketchy_freq: int = 1024,
          sketchy_accumulation: int = 512,
@@ -581,12 +581,7 @@ def main(model_size: str = "124M",
          eval_accumulation: int = 64,
          eval_batch_size: int = 16):
 
-    sketchy_rank = environ.get("SKETCHY_RANK")
-    if sketchy_rank is not None:
-        # convert 0 to None
-        sketchy_rank = int(sketchy_rank) or None
-
-    if not finetune and lora_rank is not None:
+    if not finetune and lora_rank > 0:
         raise ValueError("You cannot train a LoRA model from scratch")
 
     config = locals()
@@ -607,7 +602,7 @@ def main(model_size: str = "124M",
         params = randomize_params(params, n_layer)
 
     params = inject_uv(params)
-    if lora_rank is not None:
+    if lora_rank > 0:
         frozen, params = params, init_lora(params, lora_rank)
     else:
         frozen, params = jax.tree_map(lambda _: None, params), params
