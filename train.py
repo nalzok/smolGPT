@@ -283,19 +283,21 @@ def estimate_step(sketchy_state, loss_scale, params, frozen, es_inputs, es_targe
     s = jax.tree_map(lambda x: x[0], su, is_leaf=lambda x: isinstance(x, tuple))
     u = jax.tree_map(lambda x: x[1], su, is_leaf=lambda x: isinstance(x, tuple))
 
-    s_max_tree = jax.tree_map(lambda x: x[0], s)
-    s_max, _ = jax.flatten_util.ravel_pytree(s_max_tree)
-    s_max_norm = jnp.linalg.norm(s_max)
-    s_max_global_norm = optax.global_norm(s_max_tree)
-    s_max_max = jnp.max(s_max)
+    s_max = jax.tree_map(lambda x: x[0], s)
+    s_max_flat, _ = jax.flatten_util.ravel_pytree(s_max)
+    s_max_norm = jnp.linalg.norm(s_max_flat)
+    s_max_global_norm = optax.global_norm(s_max)
+    s_max_max = jnp.max(s_max_flat)
 
-    s_min_tree = jax.tree_map(lambda x: x[-1], s)
-    s_min, _ = jax.flatten_util.ravel_pytree(s_min_tree)
-    s_min_norm = jnp.linalg.norm(s_min)
-    s_min_global_norm = optax.global_norm(s_min_tree)
-    s_min_max = jnp.max(s_min)
+    s_min = jax.tree_map(lambda x: x[-1], s)
+    s_min_flat, _ = jax.flatten_util.ravel_pytree(s_min)
+    s_min_norm = jnp.linalg.norm(s_min_flat)
+    s_min_global_norm = optax.global_norm(s_min)
+    s_min_max = jnp.max(s_min_flat)
 
+    u_flat, _ = jax.flatten_util.ravel_pytree(u)
     u_norm = optax.global_norm(u)
+    u_global_norm = jnp.linalg.norm(u_flat)
 
     new_sketchy_state = sketchy_state._replace(s=s, u=u)
 
@@ -362,7 +364,7 @@ def estimate_step(sketchy_state, loss_scale, params, frozen, es_inputs, es_targe
 
     return new_sketchy_state, new_loss_scale, loss, grads_norm, hvps_norm, \
             s_max_norm, s_max_global_norm, s_max_max, s_min_norm, s_min_global_norm, s_min_max, \
-            u_norm, dist_spectral
+            u_norm, u_global_norm, dist_spectral
 
 
 @partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(7, 8, 9), donate_argnums=(0, 1, 2))
@@ -514,7 +516,10 @@ def train(params,
     params, frozen, opt_state, sketchy_state, loss_scale = replicate((params, frozen, opt_state, sketchy_state, loss_scale))
     device_count = jax.local_device_count()
     device_ids = jnp.arange(device_count)
-    va_loss = hvps_norm = s_max_norm = s_max_global_norm = s_max_max = s_min_norm = s_min_global_norm = s_min_max = u_norm = dist_spectral = jnp.nan
+    va_loss = hvps_norm \
+            = s_max_norm = s_max_global_norm = s_max_max \
+            = s_min_norm = s_min_global_norm = s_min_max \
+            = u_norm = u_global_norm = dist_spectral = jnp.nan
 
     tr_loader = islice(tr, max_iter)
     for step, (inputs, targets) in enumerate(pbar := tqdm(tr_loader, "Training")):
@@ -524,7 +529,7 @@ def train(params,
             step_pmap = replicate(device_count * step) + device_ids
             sketchy_state, loss_scale, loss, grads_norm, hvps_norm, \
                     s_max_norm, s_max_global_norm, s_max_max, s_min_norm, s_min_global_norm, s_min_max, \
-                    u_norm, dist_spectral \
+                    u_norm, u_global_norm, dist_spectral \
                     = estimate_step(sketchy_state, loss_scale, params, frozen, es_inputs, es_targets, step_pmap, n_head, policy)
             hvps_norm = float(unreplicate(hvps_norm))
             s_max_norm = float(unreplicate(s_max_norm))
@@ -534,6 +539,7 @@ def train(params,
             s_min_global_norm = float(unreplicate(s_min_global_norm))
             s_min_max = float(unreplicate(s_min_max))
             u_norm = float(unreplicate(u_norm))
+            u_global_norm = float(unreplicate(u_global_norm))
             dist_spectral = float(unreplicate(dist_spectral))
 
         params, opt_state, loss_scale, loss, grads_norm, precond_norm, dist_cos, dist_euc \
@@ -568,6 +574,7 @@ def train(params,
             "s_min_global_norm": s_min_global_norm,
             "s_min_max": s_min_max,
             "u_norm": u_norm,
+            "u_global_norm": u_global_norm,
             "precond_norm": precond_norm,
             "dist_cos": dist_cos,
             "dist_euc": dist_euc,
