@@ -529,7 +529,7 @@ def train(params,
         dist_euc = float(unreplicate(dist_euc))
 
         if step % eval_freq == 0:
-            va.reset()
+            # va.reset()
             va_inputs, va_targets = next(va)
             va_loss = valid_step(params, frozen, va_inputs, va_targets, n_head)
             va_loss = float(jnp.mean(va_loss))
@@ -577,8 +577,8 @@ def main(model_size: str = "124M",
          beta1: float = 0.9,
          beta2: float = 0.95,
          jmp_policy: str = "params=float32,compute=bfloat16,output=float32",
-         eval_freq: int = 64,
-         eval_accumulation: int = 64,
+         eval_freq: int = 1024,
+         eval_accumulation: int = 1024,
          eval_batch_size: int = 16):
 
     if not finetune and lora_rank > 0:
