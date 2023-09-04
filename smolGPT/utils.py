@@ -5,7 +5,6 @@ import re
 
 import numpy as np
 import jax
-import jax.numpy as jnp
 import chex
 import requests
 import tensorflow as tf
@@ -60,6 +59,8 @@ def load_gpt2_params_from_tf_ckpt(tf_ckpt_path, hparams):
         name = name[len("model/") :]
         if name.startswith("h"):
             m = re.match(r"h([0-9]+)/(.*)", name)
+            if m is None:
+                raise ValueError(f"Invalid {name = }")
             n = int(m[1])
             sub_name = m[2]
             set_in_nested_dict(params["blocks"][n], sub_name.split("/"), array)
@@ -84,6 +85,34 @@ def load_encoder_hparams_and_params(model_size, models_dir):
     params = load_gpt2_params_from_tf_ckpt(tf_ckpt_path, hparams)
 
     return encoder, hparams, params
+
+
+class DataLoader:
+    def __init__(self, filename, context_length, gradient_accumulation, batch_size, seed = 42) -> None:
+        self.data = np.memmap(filename, dtype=np.uint16, mode="r")
+        self.context_length = context_length
+        device_count = jax.local_device_count()
+        if gradient_accumulation % device_count != 0:
+            raise ValueError(f"{gradient_accumulation % device_count = }")
+        self.index_shape = (device_count, gradient_accumulation // device_count, batch_size)
+        self.shape = (device_count, gradient_accumulation // device_count, batch_size, self.context_length)
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        ix = self.rng.integers(len(self.data) - self.context_length, size=self.index_shape)
+        x = np.empty(self.shape, dtype=np.uint16)
+        y = np.empty(self.shape, dtype=np.uint16)
+        for ij, index in np.ndenumerate(ix):
+            x[ij] = self.data[index:index+self.context_length]
+            y[ij] = self.data[index+1:index+1+self.context_length]
+        return x, y
+
+    def reset(self):
+        self.rng = np.random.default_rng(self.seed)
 
 
 def replicate(tree):

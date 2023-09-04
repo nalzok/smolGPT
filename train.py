@@ -18,39 +18,12 @@ import wandb
 from smolGPT.model import gpt2
 from smolGPT.utils import (
     load_encoder_hparams_and_params,
+    DataLoader,
     replicate,
     unreplicate,
     is_penultimate,
     canonicalize_dtype,
 )
-
-
-class DataLoader:
-    def __init__(self, filename, context_length, gradient_accumulation, batch_size, seed = 42) -> None:
-        self.data = np.memmap(filename, dtype=np.uint16, mode="r")
-        self.context_length = context_length
-        device_count = jax.local_device_count()
-        if gradient_accumulation % device_count != 0:
-            raise ValueError(f"{gradient_accumulation % device_count = }")
-        self.index_shape = (device_count, gradient_accumulation // device_count, batch_size)
-        self.shape = (device_count, gradient_accumulation // device_count, batch_size, self.context_length)
-        self.seed = seed
-        self.rng = np.random.default_rng(seed)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        ix = self.rng.integers(len(self.data) - self.context_length, size=self.index_shape)
-        x = np.empty(self.shape, dtype=np.uint16)
-        y = np.empty(self.shape, dtype=np.uint16)
-        for ij, index in np.ndenumerate(ix):
-            x[ij] = self.data[index:index+self.context_length]
-            y[ij] = self.data[index+1:index+1+self.context_length]
-        return x, y
-
-    def reset(self):
-        self.rng = np.random.default_rng(self.seed)
 
 
 def path_to_key(path, data = None):
@@ -174,7 +147,7 @@ def estimate_step(sketchy_state, loss_scale, params, frozen, es_inputs, es_targe
         input_, target, mini_step = x
         grad_fn = lambda p: jax.grad(loss_fn, has_aux=True)(p, input_, target)
         hvp_fn = lambda o: jax.jvp(grad_fn, (params_compute,), (o,), has_aux=True)
-        curr_grads, curr_hvps, loss = jax.lax.map(hvp_fn, omega)
+        curr_grads, curr_hvps, loss = jax.lax.map(hvp_fn, omega)    # type: ignore
         curr_grads, loss = unreplicate((curr_grads, loss))
         welford_update = lambda acc, new: acc + (new - acc) / (mini_step + 1)
         new_grads = jax.tree_map(welford_update, grads, curr_grads)
@@ -456,7 +429,7 @@ def valid_step(params, frozen, va_inputs, va_targets, n_head):
         return loss
 
     losses = jax.lax.map(loss_fn, (va_inputs, va_targets))
-    loss = jnp.mean(losses)
+    loss = jnp.mean(losses) # type: ignore
     return loss
 
 
