@@ -11,6 +11,7 @@ import wandb
 from smolGPT.model import gpt2
 from smolGPT.utils import (
     load_encoder_hparams_and_params,
+    make_scan_friendly,
     DataLoader,
     replicate,
     unreplicate,
@@ -20,12 +21,18 @@ from smolGPT.utils import (
 
 
 
+def show(path, leaf):
+    print(path, leaf.shape)
+
+
 def svdvals_fn(params, first_n_svd):
     def svd(path, leaf):
         if len(leaf.shape) < 2:
             return None
 
         print(path, leaf.shape)
+        return
+
         r = min(leaf.shape)
         result_shape = jax.ShapeDtypeStruct((r,), leaf.dtype)
         S = jax.pure_callback(partial(np.linalg.svd, compute_uv=False, hermitian=False), result_shape, leaf)
@@ -39,15 +46,15 @@ def svdvals_fn(params, first_n_svd):
 
 
 def compress(params, va, iterations, first_n_svd, n_head):
-    # svdvals = svdvals_fn(params, first_n_svd)
+    svdvals = svdvals_fn(params, first_n_svd)
+
+    print("------")
 
     loader = islice(va, iterations)
     inputs, _ = next(loader)
 
     logits, activations = gpt2(inputs, **params, n_head=n_head)
 
-    def show(path, leaf):
-        print(path, leaf.shape)
     jax.tree_util.tree_map_with_path(show, activations)
 
 
@@ -57,10 +64,11 @@ def main(model_size: str = "124M",
          first_n_svd: int = 16,
          iterations: int = 64,
          gradient_accumulation: int = 2,
-         batch_size: int = 8):
+         batch_size: int = 4):
 
     config = locals()
     encoder, hparams, params = load_encoder_hparams_and_params(model_size, models_dir)
+    params["blocks"] = make_scan_friendly(params["blocks"])
     context_length = hparams["n_ctx"]
     n_head = hparams["n_head"]
 

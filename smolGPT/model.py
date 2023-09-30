@@ -73,16 +73,6 @@ def transformer_block(act, ln_1, attn, ln_2, mlp, n_head):
 
 
 def gpt2(inputs, wte, wpe, blocks, ln_f, n_head):
-    def access(block, path):
-        for p in path:
-            block = block[p.key]
-        return block
-
-    def collector(path, _):
-        return jnp.stack([access(block, path) for block in blocks])
-
-    blocks_transposed = jax.tree_util.tree_map_with_path(collector, blocks[0])
-
     # https://jax.readthedocs.io/en/latest/notebooks/autodiff_remat.html#practical-notes
     @partial(jax.checkpoint, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
     def f(act_block, block):
@@ -90,7 +80,7 @@ def gpt2(inputs, wte, wpe, blocks, ln_f, n_head):
         return act_block, attn_block
 
     act = wte[inputs] + wpe[:inputs.shape[-1]]
-    out_blocks, attn_blocks = jax.lax.scan(f, act, blocks_transposed)
+    out_blocks, attn_blocks = jax.lax.scan(f, act, blocks)
 
     act_wte, attn_ln = layer_norm(out_blocks, **ln_f)
     out = act_wte @ wte.T

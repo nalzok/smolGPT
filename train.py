@@ -18,6 +18,7 @@ import wandb
 from smolGPT.model import gpt2
 from smolGPT.utils import (
     load_encoder_hparams_and_params,
+    make_scan_friendly,
     DataLoader,
     replicate,
     unreplicate,
@@ -116,11 +117,23 @@ def create_sketchy_state(key, params, rank, rho, precond_dtype):
         path_hash = int(sha1(path_bytes).hexdigest(), 16) % maxsize
         key_leaf = jax.random.fold_in(key, path_hash)
 
+        # if path[0].key == "blocks":
+        #     n_blocks, *shape = x.shape
+        #     p = np.prod(shape, dtype=int)
+        #     rand = jax.random.normal(key_leaf, (p, n_blocks, rank), dtype=jnp.float32)
+        #     q, _ = jnp.linalg.qr(rand)  # jnp.linalg.qr does not support bfloat16
+        #     q = q.astype(precond_dtype or x.dtype)
+        #     q = jnp.reshape(q.T, (rank, *x.shape))
+        # else:
         p = np.prod(x.shape, dtype=int)
         rand = jax.random.normal(key_leaf, (p, rank), dtype=jnp.float32)
         q, _ = jnp.linalg.qr(rand)  # jnp.linalg.qr does not support bfloat16
         q = q.astype(precond_dtype or x.dtype)
+        print(f"{path = }, {x.shape = }, {rand.shape = }, {q.shape = }")
+        # path = (DictKey(key='blocks'), DictKey(key='attn'), DictKey(key='c_attn'), DictKey(key='u'))
+        # x.shape = (12, 1), rand.shape = (12, 16), q.shape = (12, 12)
         q = jnp.reshape(q.T, (rank, *x.shape))
+
         return q
 
     # eigenvectors
@@ -588,6 +601,7 @@ def main(model_size: str = "124M",
 
     config = locals()
     encoder, hparams, params = load_encoder_hparams_and_params(model_size, models_dir)
+    params["blocks"] = make_scan_friendly(params["blocks"])
     context_length = hparams["n_ctx"]
     n_head = hparams["n_head"]
     n_layer = hparams["n_layer"]

@@ -87,6 +87,19 @@ def load_encoder_hparams_and_params(model_size, models_dir):
     return encoder, hparams, params
 
 
+def make_scan_friendly(blocks):
+    def access(block, path):
+        for p in path:
+            block = block[p.key]
+        return block
+
+    def collector(path, _):
+        return np.stack([access(block, path) for block in blocks])
+
+    blocks_transposed = jax.tree_util.tree_map_with_path(collector, blocks[0])
+    return blocks_transposed
+
+
 class DataLoader:
     def __init__(self, filename, context_length, gradient_accumulation, batch_size, seed = 42) -> None:
         self.data = np.memmap(filename, dtype=np.uint16, mode="r")
